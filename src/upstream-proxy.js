@@ -190,7 +190,15 @@ export function proxyAgent(proxy, { targetHost, targetPort, tls: useTls = true, 
       label: 'upstream proxy',
     })
       .then((sock) => {
-        if (!useTls) return cb(null, sock);
+        if (!useTls) {
+          // connectThroughProxy pauses the socket so a TLS layer sees every
+          // byte. Nothing resumes it on the plaintext path, so the HTTP parser
+          // would attach to a socket that never flows and the request would sit
+          // until the headers deadline. Resume after the caller has it.
+          cb(null, sock);
+          sock.resume();
+          return;
+        }
         // TLS is established end-to-end over the tunnel, so the proxy sees only
         // ciphertext and cert verification stays at its secure default.
         const tlsSock = tls.connect({ socket: sock, servername: targetHost, ...tlsOptions });

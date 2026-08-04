@@ -35,7 +35,9 @@ test('credentials survive a round trip through percent-encoding', () => {
 
 test('a wrong protocol is named rather than failing later inside the tunnel', () => {
   assert.throws(() => parseProxyUrl('socks5://host:1080'), /unsupported proxy protocol "socks5"/);
-  assert.throws(() => parseProxyUrl('http://host:99999'), /invalid port/);
+  // Node's URL rejects an out-of-range port itself; either message is fine as
+  // long as it names the offending value rather than failing at connect time.
+  assert.throws(() => parseProxyUrl('http://host:99999'), /invalid proxy URL|invalid port/);
 });
 
 test('describeProxy masks the password', () => {
@@ -144,7 +146,7 @@ test('an upstream request is tunneled through the configured proxy', async () =>
   setUpstreamProxy(resolveUpstreamProxy({ upstreamProxy: `127.0.0.1:${proxyPort}` }));
 
   try {
-    const res = await upstreamFetch(`http://127.0.0.1:${originPort}/v1/messages`, { method: 'GET' });
+    const res = await upstreamFetch(`http://127.0.0.1:${originPort}/v1/messages`, { method: 'GET', headersTimeoutMs: 8000 });
     assert.equal(res.status, 200);
     assert.deepEqual(JSON.parse(await res.text()), { ok: true, path: '/v1/messages' });
     assert.deepEqual(targets, [`127.0.0.1:${originPort}`]);   // it really went through the proxy
@@ -163,7 +165,7 @@ test('proxy credentials are offered as Proxy-Authorization', async () => {
   setUpstreamProxy(resolveUpstreamProxy({ upstreamProxy: `http://bob:s3cret@127.0.0.1:${proxyPort}` }));
 
   try {
-    await upstreamFetch(`http://127.0.0.1:${originPort}/x`, { method: 'GET' });
+    await upstreamFetch(`http://127.0.0.1:${originPort}/x`, { method: 'GET', headersTimeoutMs: 8000 });
     assert.equal(auth(), `Basic ${Buffer.from('bob:s3cret').toString('base64')}`);
   } finally {
     proxy.close();
@@ -185,7 +187,7 @@ test('control-plane calls (oauth) are tunneled too', async () => {
   setUpstreamProxy(resolveUpstreamProxy({ upstreamProxy: `127.0.0.1:${proxyPort}` }));
 
   try {
-    const res = await proxyFetch(`http://127.0.0.1:${originPort}/oauth/token`, { method: 'POST', body: '{}' });
+    const res = await proxyFetch(`http://127.0.0.1:${originPort}/oauth/token`, { method: 'POST', body: '{}', headersTimeoutMs: 8000 });
     assert.equal(res.ok, true);
     assert.deepEqual(await res.json(), { access_token: 'a' });
     assert.equal(targets.length, 1);
@@ -205,7 +207,7 @@ test('a bypassed host goes direct even with a proxy configured', async () => {
   setUpstreamProxy(resolveUpstreamProxy({ upstreamProxy: `127.0.0.1:${proxyPort}`, noProxy: '127.0.0.1' }));
 
   try {
-    const res = await upstreamFetch(`http://127.0.0.1:${originPort}/x`, { method: 'GET' });
+    const res = await upstreamFetch(`http://127.0.0.1:${originPort}/x`, { method: 'GET', headersTimeoutMs: 8000 });
     assert.equal(await res.text(), 'direct');
     assert.deepEqual(targets, []);                            // the proxy was never asked
   } finally {
@@ -246,7 +248,7 @@ test('a refused CONNECT names the upstream proxy', async () => {
 
   try {
     await assert.rejects(
-      upstreamFetch('http://198.51.100.7:443/x', { method: 'GET' }),
+      upstreamFetch('http://198.51.100.7:443/x', { method: 'GET', headersTimeoutMs: 8000 }),
       /upstream proxy refused CONNECT: HTTP\/1\.1 403/,
     );
   } finally {
