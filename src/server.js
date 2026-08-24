@@ -53,9 +53,36 @@ export function isLoopbackAddr(addr) {
   return addr === '127.0.0.1' || addr === '::1' || addr === '::ffff:127.0.0.1';
 }
 
-export function createProxyServer(accountManager, config, hooks = {}, sx = null) {
+/**
+ * Which identity a presented key authenticates as, checked against the shared
+ * `proxy.apiKey` and every `proxy.clientKeys` entry ({ name, key }).
+ *
+ * Returns { ok, client }: ok=false → reject; `client` is the matching entry's
+ * name (per-client usage is booked against it), or null for the shared key —
+ * the shared key predates client identities and stays unattributed rather than
+ * inventing one. With no keys configured at all the gate is open (unchanged
+ * behavior), also unattributed.
+ *
+ * Client keys are checked first so a clientKeys entry that duplicates the
+ * shared key still yields its name. Every candidate uses the constant-time
+ * compare; the key count is operator-controlled and small, so scanning all of
+ * them leaks nothing useful.
+ */
+export function resolveClientAuth(proxyConfig, presented) {
+  const shared = proxyConfig?.apiKey;
+  const clientKeys = Array.isArray(proxyConfig?.clientKeys) ? proxyConfig.clientKeys : [];
+  if (!shared && clientKeys.length === 0) return { ok: true, client: null };
+  for (const entry of clientKeys) {
+    if (entry?.key && safeKeyEqual(presented, entry.key)) {
+      return { ok: true, client: entry.name || null };
+    }
+  }
+  if (shared && safeKeyEqual(presented, shared)) return { ok: true, client: null };
+  return { ok: false, client: null };
+}
+
+export function createProxyServer(accountManager, config, hooks = {}, sx = null, clientUsage = null) {
   const upstream = config.upstream || 'https://api.anthropic.com';
-  const proxyApiKey = config.proxy?.apiKey;
   const logDir = config.logDir || null;
   const holdMs = (config.holdSeconds || 0) * 1000;
 
@@ -65,10 +92,14 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null)
 
   const requestHandler = async (req, res) => {
     try {
-      // Auth check — skip for localhost connections.
+      // Auth check — skip for localhost connections. `config.proxy` is read per
+      // request (not captured at creation) so a reload that edits clientKeys
+      // applies to a running server, matching how eventLogging/blockedModels
+      // are read live further down the pipeline.
       const clientKey = req.headers['x-api-key'];
       const isLocal = isLoopbackAddr(req.socket.remoteAddress);
-      if (proxyApiKey && !safeKeyEqual(clientKey, proxyApiKey) && !isLocal) {
+      const auth = resolveClientAuth(config.proxy, clientKey);
+      if (!auth.ok && !isLocal) {
         res.writeHead(401, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({
           type: 'error',
@@ -76,6 +107,10 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null)
         }));
         return;
       }
+      // Client identity for per-client usage. A loopback caller that presented
+      // a valid client key is attributed like any other; loopback without one
+      // passed only via the exemption and stays unattributed.
+      req.tcClient = auth.ok ? auth.client : null;
 
       // Control-plane mutations are refused when the request was issued by a web
       // page. The gate above exempts loopback from the API key, so without this
@@ -199,7 +234,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null)
   // Opt-in egress pin: null unless config.egress.pin is set, and then shared by
   // the base listener and the MITM one so both honour the same hold.
   const egress = createEgressGuard(config, console.error);
-  const forward = createProxyRequestListener({ accountManager, upstream, logDir, hooks, sx, holdMs, config, egress });
+  const forward = createProxyRequestListener({ accountManager, upstream, logDir, hooks, sx, holdMs, config, egress, clientUsage });
   const server = http.createServer(requestHandler);
 
   // Forward-proxy support (always on, so multiple claude instances can use
@@ -216,7 +251,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null)
     const c = await certsPromise;
     return { key: c.leafKeyPem, cert: c.leafCertPem };
   };
-  server.on('connect', createConnectHandler({ config, accountManager, ensureLeaf, logDir, hooks, log: console.error, sx, egress }));
+  server.on('connect', createConnectHandler({ config, accountManager, ensureLeaf, logDir, hooks, log: console.error, sx, egress, clientUsage }));
   // Remote Control's real-time channel is a WebSocket, not a request/response
   // call — Node fires 'upgrade' for that handshake, never 'request', so it
   // needs its own listener (base-URL routing path; the MITM path wires the
@@ -358,7 +393,7 @@ const CLIENT_CREDENTIAL_PATHS = ['/v1/code/', '/api/oauth/files/', '/api/oauth/f
  * aware routing, and retry-on-quota behavior. Control endpoints (status/reload)
  * and the proxy-API-key gate live in the base server's wrapper, not here.
  */
-export function createProxyRequestListener({ accountManager, upstream, logDir = null, hooks = {}, sx = null, holdMs = 0, config = {}, forcedPin = null, egress = null }) {
+export function createProxyRequestListener({ accountManager, upstream, logDir = null, hooks = {}, sx = null, holdMs = 0, config = {}, forcedPin = null, egress = null, clientUsage = null, forcedClient = null }) {
   let counter = 0;
   return async (req, res) => {
     try {
@@ -459,7 +494,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       // /v1/messages and count_tokens). Read from headers up front so it drives
       // session-aware routing (issue #109) and colors the TUI activity stream.
       const sessionId = req.headers['x-claude-code-session-id'] || null;
-      if (!hideActivity) hooks.onRequestStart?.(reqId, { method: req.method, path: req.url, sessionId, pinned: pinnedIndex != null });
+      if (!hideActivity) hooks.onRequestStart?.(reqId, { method: req.method, path: req.url, sessionId, pinned: pinnedIndex != null, client: req.tcClient ?? forcedClient ?? null });
 
       // Buffer request body (needed to resend on a different account after a 429).
       // Peek the top-level `model` field incrementally as chunks arrive so the
@@ -497,7 +532,19 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
         return;
       }
 
-      const ctx = { account: null, status: null, tried: new Set(), reauthed: new Set(), model, advisorModel, pinnedIndex, holdBudgetMs: holdMs, sessionId };
+      // Per-client attribution: the base server stamps req.tcClient from the
+      // key that authenticated; the MITM terminating server has no per-request
+      // key (auth happened at CONNECT time) and carries it as forcedClient
+      // instead — the same split as the account pin. onUsage lets the usage
+      // extraction deep in the response path book tokens against the client
+      // without threading the name through every layer.
+      const client = req.tcClient ?? forcedClient ?? null;
+      const onUsage = (client && clientUsage)
+        ? (inputTokens, outputTokens) => clientUsage.record(client, { inputTokens, outputTokens })
+        : null;
+      if (client && clientUsage) clientUsage.record(client, { requests: 1 });
+
+      const ctx = { account: null, status: null, tried: new Set(), reauthed: new Set(), model, advisorModel, pinnedIndex, holdBudgetMs: holdMs, sessionId, client, onUsage };
       // Hold the session "in flight" across the WHOLE request (incl. retries and
       // a multi-minute streaming completion) so it stays counted as active and
       // never expires mid-request.
@@ -513,7 +560,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
         }
       } finally {
         accountManager.endSession(sessionId);
-        if (!hideActivity) hooks.onRequestEnd?.(reqId, { method: req.method, path: req.url, account: ctx.account, status: ctx.status, model: ctx.model, sessionId, pinned: ctx.pinnedIndex != null });
+        if (!hideActivity) hooks.onRequestEnd?.(reqId, { method: req.method, path: req.url, account: ctx.account, status: ctx.status, model: ctx.model, sessionId, pinned: ctx.pinnedIndex != null, client });
       }
     } catch (err) {
       console.error('[TeamClaude] Unhandled error:', err);
@@ -1094,11 +1141,11 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       // whole (potentially ~1M-token) SSE body in memory.
       const l = getLog();
       const bw = l ? l.bodyWriter('RESPONSE BODY (streamed)', contentType) : null;
-      await streamResponse(upstreamRes.body, res, account.index, accountManager, bw);
+      await streamResponse(upstreamRes.body, res, account.index, accountManager, bw, ctx.onUsage);
       l?.end();
     } else {
       const buf = Buffer.from(await upstreamRes.arrayBuffer());
-      extractUsageFromBody(buf, account.index, accountManager);
+      extractUsageFromBody(buf, account.index, accountManager, ctx.onUsage);
       const l = getLog();
       if (l) { l.body('RESPONSE BODY', buf, contentType); l.end(); }
       res.end(buf);
@@ -1197,7 +1244,7 @@ export function readWithIdleTimeout(reader, ms) {
 /**
  * Stream an SSE response to the client, parsing usage data along the way.
  */
-async function streamResponse(webStream, res, accountIndex, accountManager, bodyWriter) {
+async function streamResponse(webStream, res, accountIndex, accountManager, bodyWriter, onUsage = null) {
   const reader = webStream.getReader();
   const idleMs = resolveBodyIdleTimeout();
   const decoder = new TextDecoder();
@@ -1226,7 +1273,7 @@ async function streamResponse(webStream, res, accountIndex, accountManager, body
       sseBuffer = events.pop(); // keep incomplete event
 
       for (const event of events) {
-        parseSSEUsage(event, accountIndex, accountManager);
+        parseSSEUsage(event, accountIndex, accountManager, onUsage);
       }
 
       // Handle backpressure — also bail out if client disconnects,
@@ -1246,7 +1293,7 @@ async function streamResponse(webStream, res, accountIndex, accountManager, body
 
     // Parse any remaining buffer
     if (sseBuffer.trim()) {
-      parseSSEUsage(sseBuffer, accountIndex, accountManager);
+      parseSSEUsage(sseBuffer, accountIndex, accountManager, onUsage);
     }
   } catch (err) {
     // A mid-stream idle timeout (or any read error) means the upstream went
@@ -1264,7 +1311,7 @@ async function streamResponse(webStream, res, accountIndex, accountManager, body
   }
 }
 
-function parseSSEUsage(event, accountIndex, accountManager) {
+function parseSSEUsage(event, accountIndex, accountManager, onUsage = null) {
   const dataLine = event.split('\n').find(l => l.startsWith('data: '));
   if (!dataLine) return;
 
@@ -1272,19 +1319,22 @@ function parseSSEUsage(event, accountIndex, accountManager) {
     const data = JSON.parse(dataLine.slice(6));
     if (data.type === 'message_start' && data.message?.usage) {
       accountManager.updateUsage(accountIndex, data.message.usage.input_tokens, 0);
+      onUsage?.(data.message.usage.input_tokens || 0, 0);
     } else if (data.type === 'message_delta' && data.usage) {
       accountManager.updateUsage(accountIndex, 0, data.usage.output_tokens);
+      onUsage?.(0, data.usage.output_tokens || 0);
     }
   } catch {
     // not valid JSON, skip
   }
 }
 
-function extractUsageFromBody(buffer, accountIndex, accountManager) {
+function extractUsageFromBody(buffer, accountIndex, accountManager, onUsage = null) {
   try {
     const json = JSON.parse(buffer.toString());
     if (json.usage) {
       accountManager.updateUsage(accountIndex, json.usage.input_tokens, json.usage.output_tokens);
+      onUsage?.(json.usage.input_tokens || 0, json.usage.output_tokens || 0);
     }
   } catch {
     // not JSON or no usage
