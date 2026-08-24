@@ -13,6 +13,7 @@ import { BodyWriter } from './request-log.js';
 import { upstreamFetch } from './upstream-fetch.js';
 import { tunnelTls } from './sx.js';
 import { createEgressGuard } from './egress-guard.js';
+import { renderDashboardHtml } from './dashboard.js';
 
 
 export const HOP_BY_HOP_HEADERS = new Set([
@@ -65,6 +66,18 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null)
 
   const requestHandler = async (req, res) => {
     try {
+      // Dashboard page — served BEFORE the auth gate on purpose. The page is a
+      // static asset containing no data: everything it shows comes from
+      // /teamclaude/status, which stays behind the gate and is fetched by the
+      // page's own script with the key. A browser address bar cannot send
+      // x-api-key, so gating the asset would just 401 every remote browser
+      // without protecting anything.
+      if (req.method === 'GET' && req.url === '/teamclaude/dashboard') {
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+        res.end(renderDashboardHtml());
+        return;
+      }
+
       // Auth check — skip for localhost connections.
       const clientKey = req.headers['x-api-key'];
       const isLocal = isLoopbackAddr(req.socket.remoteAddress);
