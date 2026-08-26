@@ -14,6 +14,7 @@ import { upstreamFetch } from './upstream-fetch.js';
 import { tunnelTls } from './sx.js';
 import { createEgressGuard } from './egress-guard.js';
 import { renderDashboardHtml } from './dashboard.js';
+import { createUsageRecorder, resolveUsageDimensions } from './client-usage.js';
 
 
 export const HOP_BY_HOP_HEADERS = new Set([
@@ -82,7 +83,7 @@ export function resolveClientAuth(proxyConfig, presented) {
   return { ok: false, client: null };
 }
 
-export function createProxyServer(accountManager, config, hooks = {}, sx = null, clientUsage = null) {
+export function createProxyServer(accountManager, config, hooks = {}, sx = null, clientUsage = null, dimensionUsage = null) {
   const upstream = config.upstream || 'https://api.anthropic.com';
   const logDir = config.logDir || null;
   const holdMs = (config.holdSeconds || 0) * 1000;
@@ -247,7 +248,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
   // Opt-in egress pin: null unless config.egress.pin is set, and then shared by
   // the base listener and the MITM one so both honour the same hold.
   const egress = createEgressGuard(config, console.error);
-  const forward = createProxyRequestListener({ accountManager, upstream, logDir, hooks, sx, holdMs, config, egress, clientUsage });
+  const forward = createProxyRequestListener({ accountManager, upstream, logDir, hooks, sx, holdMs, config, egress, clientUsage, dimensionUsage });
   const server = http.createServer(requestHandler);
 
   // Forward-proxy support (always on, so multiple claude instances can use
@@ -264,7 +265,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
     const c = await certsPromise;
     return { key: c.leafKeyPem, cert: c.leafCertPem };
   };
-  server.on('connect', createConnectHandler({ config, accountManager, ensureLeaf, logDir, hooks, log: console.error, sx, egress, clientUsage }));
+  server.on('connect', createConnectHandler({ config, accountManager, ensureLeaf, logDir, hooks, log: console.error, sx, egress, clientUsage, dimensionUsage }));
   // Remote Control's real-time channel is a WebSocket, not a request/response
   // call — Node fires 'upgrade' for that handshake, never 'request', so it
   // needs its own listener (base-URL routing path; the MITM path wires the
@@ -406,7 +407,7 @@ const CLIENT_CREDENTIAL_PATHS = ['/v1/code/', '/api/oauth/files/', '/api/oauth/f
  * aware routing, and retry-on-quota behavior. Control endpoints (status/reload)
  * and the proxy-API-key gate live in the base server's wrapper, not here.
  */
-export function createProxyRequestListener({ accountManager, upstream, logDir = null, hooks = {}, sx = null, holdMs = 0, config = {}, forcedPin = null, egress = null, clientUsage = null, forcedClient = null }) {
+export function createProxyRequestListener({ accountManager, upstream, logDir = null, hooks = {}, sx = null, holdMs = 0, config = {}, forcedPin = null, egress = null, clientUsage = null, forcedClient = null, dimensionUsage = null }) {
   let counter = 0;
   return async (req, res) => {
     try {
@@ -507,7 +508,9 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       // /v1/messages and count_tokens). Read from headers up front so it drives
       // session-aware routing (issue #109) and colors the TUI activity stream.
       const sessionId = req.headers['x-claude-code-session-id'] || null;
-      if (!hideActivity) hooks.onRequestStart?.(reqId, { method: req.method, path: req.url, sessionId, pinned: pinnedIndex != null, client: req.tcClient ?? forcedClient ?? null });
+      const client = req.tcClient ?? forcedClient ?? null;
+      const usageDimensions = resolveUsageDimensions(config.proxy, req.headers);
+      if (!hideActivity) hooks.onRequestStart?.(reqId, { method: req.method, path: req.url, sessionId, pinned: pinnedIndex != null, client });
 
       // Buffer request body (needed to resend on a different account after a 429).
       // Peek the top-level `model` field incrementally as chunks arrive so the
@@ -551,13 +554,10 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       // instead — the same split as the account pin. onUsage lets the usage
       // extraction deep in the response path book tokens against the client
       // without threading the name through every layer.
-      const client = req.tcClient ?? forcedClient ?? null;
-      const onUsage = (client && clientUsage)
-        ? (inputTokens, outputTokens) => clientUsage.record(client, { inputTokens, outputTokens })
-        : null;
-      if (client && clientUsage) clientUsage.record(client, { requests: 1 });
+      const usageRecorder = createUsageRecorder({ client, clientUsage, dimensions: usageDimensions, dimensionUsage });
+      usageRecorder.recordRequest();
 
-      const ctx = { account: null, status: null, tried: new Set(), reauthed: new Set(), model, advisorModel, pinnedIndex, holdBudgetMs: holdMs, sessionId, client, onUsage };
+      const ctx = { account: null, status: null, tried: new Set(), reauthed: new Set(), model, advisorModel, pinnedIndex, holdBudgetMs: holdMs, sessionId, client, onUsage: usageRecorder.onUsage };
       // Hold the session "in flight" across the WHOLE request (incl. retries and
       // a multi-minute streaming completion) so it stays counted as active and
       // never expires mid-request.

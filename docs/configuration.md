@@ -41,6 +41,7 @@ Volatile runtime state (observed quota) is written separately to `teamclaude.sta
 | `proxy.host` | Interface to bind. Defaults to `127.0.0.1` (localhost only). Set to `0.0.0.0` (or override with env `TEAMCLAUDE_HOST`) to accept off-box clients — in which case **set `proxy.apiKey`**, since remote clients must present it (via `x-api-key`, or `Proxy-Authorization` for CONNECT/HTTPS-proxy usage); loopback is always exempt |
 | `proxy.apiKey` | API key clients use to authenticate with the proxy (required for any non-loopback client; the proxy injects real account tokens, so an unauthenticated open port would leak them) |
 | `proxy.clientKeys` | Optional per-client keys: `[{ "name": "alice", "key": "tc-…" }, …]`. Each entry authenticates exactly like `proxy.apiKey`, and the tokens its responses report are booked against `name` — per-client usage shows up under `clients` in `/teamclaude/status`, in `teamclaude status`, and (with `--activity-log`) as a `[name]` prefix on each request line. Counters persist in the state file. Traffic on the shared `proxy.apiKey` or the loopback exemption stays unattributed, so give every consumer their own entry when you want complete stats. Edits apply live via `POST /teamclaude/reload` |
+| `proxy.usageDimensions` | Optional request-header usage dimensions: `[{ "name": "project", "header": "x-teamclaude-project" }, …]`. For each request, TeamClaude reads the configured headers and books the response tokens against their sanitized values under `usageDimensions` in `/teamclaude/status`, `teamclaude status`, and the dashboard. Missing headers are simply unattributed for that dimension. Configured dimensions persist in the state file; the built-in `session` dimension from `x-claude-code-session-id` is capped and kept in memory only. Edits apply live via `POST /teamclaude/reload` |
 | `upstream` | Upstream API base URL |
 | `switchThreshold` | Quota utilization (0–1) at which to switch accounts (TUI settings screen: **Switch threshold**) |
 | `quotaProbeSeconds` | Background [quota-probe](quota.md#quota-probe) interval in seconds (`0` = off, the default; CLI `probe`, or the **Quota probe** row on the TUI settings screen) |
@@ -78,6 +79,41 @@ Volatile runtime state (observed quota) is written separately to `teamclaude.sta
 ```bash
 TEAMCLAUDE_CONFIG=./my-config.json teamclaude server
 ```
+
+## Usage Dimensions
+
+Usage dimensions let operators answer which project, branch, pull request, or CI job consumed tokens without adding new TeamClaude code for every grouping. Configure the dimensions once on the proxy:
+
+```json
+{
+  "proxy": {
+    "usageDimensions": [
+      { "name": "project", "header": "x-teamclaude-project" },
+      { "name": "ref", "header": "x-teamclaude-ref" }
+    ]
+  }
+}
+```
+
+Developers can set a project identity per repository in `.claude/settings.json`:
+
+```json
+{
+  "env": {
+    "ANTHROPIC_CUSTOM_HEADERS": "X-Teamclaude-Project: KarpelesLab/teamclaude"
+  }
+}
+```
+
+CI can set several dimensions with newline-separated custom headers:
+
+```bash
+export ANTHROPIC_CUSTOM_HEADERS=$'X-Teamclaude-Project: KarpelesLab/teamclaude\nX-Teamclaude-Ref: pull/123'
+```
+
+Use stable, low-cardinality values such as `org/repo`, `pull/123`, or a branch name. Header values are client supplied, sanitized on ingest, and capped before they reach status output. Do not put secrets into usage dimensions; the custom headers are forwarded with the proxied API request.
+
+Claude Code reserves or rejects several header names. Do not configure dimensions with `x-app`, `x-claude-code-session-id`, `x-claude-code-agent-id`, `x-claude-code-parent-agent-id`, `x-anthropic-additional-protection`, `authorization`, or `x-api-key`.
 
 ## Network resilience
 

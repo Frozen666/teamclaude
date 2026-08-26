@@ -84,6 +84,7 @@ const PAGE = `<!doctype html>
       <h2>Clients</h2>
       <div class="card" style="padding:4px 6px"><table id="clients"></table></div>
     </div>
+    <div id="dimensions"></div>
     <footer id="foot"></footer>
   </div>
 </main>
@@ -221,6 +222,51 @@ const PAGE = `<!doctype html>
     });
   }
 
+  function titleForDimension(name) {
+    if (name === 'session') return 'Sessions usage';
+    return name.charAt(0).toUpperCase() + name.slice(1) + ' usage';
+  }
+
+  function renderUsageTable(table, entries, firstHeader) {
+    var names = Object.keys(entries || {});
+    names.sort(function (a, b) {
+      var ca = entries[a], cb = entries[b];
+      return ((cb.inputTokens || 0) + (cb.outputTokens || 0)) - ((ca.inputTokens || 0) + (ca.outputTokens || 0));
+    });
+    table.textContent = '';
+    var hr = el('tr');
+    [firstHeader, 'Requests', 'Input tok', 'Output tok', 'Last used'].forEach(function (h, i) {
+      hr.appendChild(el('th', i ? 'num' : '', h));
+    });
+    table.appendChild(hr);
+    names.forEach(function (n) {
+      var c = entries[n];
+      var tr = el('tr');
+      tr.appendChild(el('td', '', n));
+      tr.appendChild(el('td', 'num', fmtNum(c.requests)));
+      tr.appendChild(el('td', 'num', fmtNum(c.inputTokens)));
+      tr.appendChild(el('td', 'num', fmtNum(c.outputTokens)));
+      tr.appendChild(el('td', 'num', c.lastUsed ? fmtAgo(c.lastUsed) : '—'));
+      table.appendChild(tr);
+    });
+  }
+
+  function renderDimensions(dimensions) {
+    var root = document.getElementById('dimensions');
+    root.textContent = '';
+    Object.keys(dimensions || {}).sort().forEach(function (name) {
+      var entries = dimensions[name] || {};
+      if (!Object.keys(entries).length) return;
+      root.appendChild(el('h2', '', titleForDimension(name)));
+      var card = el('div', 'card');
+      card.style.padding = '4px 6px';
+      var table = el('table');
+      renderUsageTable(table, entries, name === 'session' ? 'Session' : name);
+      card.appendChild(table);
+      root.appendChild(card);
+    });
+  }
+
   function render(s) {
     var sess = s.sessions || {};
     var up = s.server && s.server.uptimeSeconds != null ? 'up ' + fmtIn(s.server.uptimeSeconds) : '';
@@ -233,6 +279,7 @@ const PAGE = `<!doctype html>
     acc.textContent = '';
     (s.accounts || []).forEach(function (a) { acc.appendChild(renderAccount(a, s.currentAccount)); });
     renderClients(s.clients);
+    renderDimensions(s.usageDimensions);
     document.getElementById('foot').textContent = 'refreshes every ' + (POLL_MS / 1000) + 's · ' + new Date().toLocaleTimeString();
   }
 

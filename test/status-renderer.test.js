@@ -127,6 +127,30 @@ test('renderStatus sanitizes probe errors', () => {
   assert.doesNotMatch(output, /\x1b\[31m/);
 });
 
+test('renderStatus prints usage dimensions and sanitizes their labels', () => {
+  const status = sampleStatus();
+  status.usageDimensions = {
+    project: {
+      'KarpelesLab/teamclaude': { requests: 2, inputTokens: 1000, outputTokens: 250, lastUsed: '2026-07-03T11:59:00Z' },
+    },
+    session: {
+      '018e3d4f-7a8b-4f00-9f6e-111111111111': { requests: 1, inputTokens: 20, outputTokens: 5, lastUsed: '2026-07-03T11:58:00Z' },
+    },
+    'bad\x1b[31mname': {
+      'value\nred': { requests: 1, inputTokens: 1, outputTokens: 1 },
+    },
+  };
+
+  const output = renderStatus(status, { color: false, now });
+  assert.match(output, /Project usage/);
+  assert.match(output, /KarpelesLab\/teamclaude\s+2 req, 1.0k in \/ 250 out, last 1m ago/);
+  assert.match(output, /Sessions usage/);
+  assert.match(output, /018e3d4f-7a8b-4f00-9f6e-111111111111\s+1 req, 20 in \/ 5 out, last 2m ago/);
+  assert.match(output, /Bad name usage/);
+  assert.match(output, /value red/);
+  assert.doesNotMatch(output, /\x1b\[31m/);
+});
+
 // --- blocklist visibility (issue: a blocked model read as available) ---------
 // `Models` reports quota headroom, so a fully-blocked family used to render ✓
 // while every request for it got a 400. Quota and the blocklist are separate

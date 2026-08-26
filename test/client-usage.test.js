@@ -4,13 +4,20 @@ import http from 'node:http';
 import { AccountManager } from '../src/account-manager.js';
 import { createProxyServer, resolveClientAuth } from '../src/server.js';
 import { resolveConnectAuth, resolveConnectPin } from '../src/mitm.js';
-import { ClientUsageTracker } from '../src/client-usage.js';
+import { ClientUsageTracker, UsageDimensionTracker, resolveUsageDimensions, sanitizeUsageDimensionValue } from '../src/client-usage.js';
 
 function listen(server) {
   return new Promise(resolve => server.listen(0, '127.0.0.1', () => resolve(server.address().port)));
 }
 
 const PROXY = { apiKey: 'shared-key', clientKeys: [{ name: 'alice', key: 'alice-key' }, { name: 'bob', key: 'bob-key' }] };
+const PROXY_WITH_DIMENSIONS = {
+  ...PROXY,
+  usageDimensions: [
+    { name: 'project', header: 'x-teamclaude-project' },
+    { name: 'ref', header: 'x-teamclaude-ref' },
+  ],
+};
 
 // ── ClientUsageTracker ──────────────────────────────────────
 
@@ -42,6 +49,87 @@ test('restore is additive and survives malformed entries', () => {
   assert.deepEqual(out.bob, { requests: 1, inputTokens: 4, outputTokens: 2, lastUsed: null });
   assert.equal(out.mallory, undefined);
   assert.equal(Object.keys(out).length, 2);
+});
+
+// ── UsageDimensionTracker ───────────────────────────────────
+
+test('usage dimensions aggregate independently and restore additively', () => {
+  const t = new UsageDimensionTracker({ now: () => 5000 });
+  t.record('project', 'KarpelesLab/teamclaude', { requests: 1, inputTokens: 7 });
+  t.record('ref', 'pull/123', { requests: 1, outputTokens: 3 });
+  t.restore({
+    project: {
+      'KarpelesLab/teamclaude': { requests: 2, inputTokens: 10, outputTokens: 4, lastUsed: new Date(1000).toISOString() },
+      bad: 'not-an-object',
+    },
+    session: {
+      'session-should-not-restore': { requests: 99 },
+    },
+    'bad name': {
+      ignored: { requests: 1 },
+    },
+  });
+
+  assert.deepEqual(t.export(), {
+    project: {
+      'KarpelesLab/teamclaude': { requests: 3, inputTokens: 17, outputTokens: 4, lastUsed: new Date(5000).toISOString() },
+    },
+    ref: {
+      'pull/123': { requests: 1, inputTokens: 0, outputTokens: 3, lastUsed: new Date(5000).toISOString() },
+    },
+  });
+});
+
+test('usage dimensions cap cardinality and expire sessions', () => {
+  let now = 1000;
+  const t = new UsageDimensionTracker({ now: () => now, maxKeys: 2, sessionMaxKeys: 2, sessionTtlMs: 1000 });
+  t.record('project', 'one', { requests: 1 });
+  t.record('project', 'two', { requests: 1 });
+  t.record('project', 'three', { requests: 1 });
+  assert.deepEqual(Object.keys(t.export().project), ['two', 'three']);
+
+  t.record('session', 's1', { requests: 1 });
+  now = 1500;
+  t.record('session', 's2', { requests: 1 });
+  now = 2499;
+  t.record('session', 's3', { requests: 1 });
+  assert.deepEqual(Object.keys(t.export().session), ['s2', 's3']);
+  const persisted = t.export({ includeSessions: false });
+  assert.deepEqual(persisted, { project: t.export().project });
+});
+
+test('resolveUsageDimensions reads configured headers and sanitizes values', () => {
+  const escape = '\x1b[31m';
+  const long = 'x'.repeat(250);
+  assert.deepEqual(resolveUsageDimensions(PROXY_WITH_DIMENSIONS, {
+    'x-teamclaude-project': ` Karpeles${escape}Lab/teamclaude\n`,
+    'x-teamclaude-ref': long,
+    'x-claude-code-session-id': '018e3d4f-7a8b-4f00-9f6e-111111111111',
+  }), [
+    { name: 'project', key: 'Karpeles Lab/teamclaude' },
+    { name: 'ref', key: 'x'.repeat(200) },
+    { name: 'session', key: '018e3d4f-7a8b-4f00-9f6e-111111111111' },
+  ]);
+});
+
+test('resolveUsageDimensions skips missing, malformed, and reserved headers', () => {
+  assert.deepEqual(resolveUsageDimensions({
+    usageDimensions: [
+      { name: 'project', header: 'x-teamclaude-project' },
+      { name: 'bad name', header: 'x-teamclaude-ref' },
+      { name: 'secret', header: 'authorization' },
+      { name: 'api', header: 'x-api-key' },
+      { name: 'app', header: 'x-app' },
+    ],
+  }, {
+    'x-teamclaude-ref': 'pull/123',
+    authorization: 'Bearer secret',
+    'x-api-key': 'tc-secret',
+    'x-app': 'claude-code',
+    'x-claude-code-session-id': 'not a valid session id',
+  }), []);
+
+  assert.equal(sanitizeUsageDimensionValue('\x00\x1b[35m project\tname '), 'project name');
 });
 
 // ── resolveClientAuth (HTTP gate) ───────────────────────────
@@ -112,10 +200,10 @@ function usageUpstream() {
   });
 }
 
-async function postAs(port, key, path = '/v1/messages') {
+async function postAs(port, key, path = '/v1/messages', extraHeaders = {}) {
   const res = await fetch(`http://127.0.0.1:${port}${path}`, {
     method: 'POST',
-    headers: { 'content-type': 'application/json', ...(key ? { 'x-api-key': key } : {}) },
+    headers: { 'content-type': 'application/json', ...(key ? { 'x-api-key': key } : {}), ...extraHeaders },
     body: JSON.stringify({ model: 'x', messages: [] }),
   });
   await res.text();
@@ -145,6 +233,44 @@ test('per-client usage: tokens are booked against the key that authenticated', a
     // per-ACCOUNT accounting is untouched by attribution: all four requests land on it
     assert.equal(am.accounts[0].usage.totalInputTokens, 7 + 100 + 7 + 7);
     assert.equal(am.accounts[0].usage.totalOutputTokens, 3 + 40 + 3 + 3);
+  } finally {
+    proxy.close();
+    upstream.close();
+  }
+});
+
+test('usage dimensions: tokens are booked against project and session for JSON and SSE', async () => {
+  const upstream = usageUpstream();
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager([{ name: 'acct', type: 'api_key', apiKey: 'sk-a' }], 0.98);
+  const clientTracker = new ClientUsageTracker();
+  const dimensionTracker = new UsageDimensionTracker();
+  const proxy = createProxyServer(am, { proxy: PROXY_WITH_DIMENSIONS, upstream: `http://127.0.0.1:${upstreamPort}` }, {}, null, clientTracker, dimensionTracker);
+  const proxyPort = await listen(proxy);
+
+  try {
+    const headers = {
+      'x-teamclaude-project': 'KarpelesLab/teamclaude',
+      'x-teamclaude-ref': 'pull/123',
+      'x-claude-code-session-id': '018e3d4f-7a8b-4f00-9f6e-111111111111',
+    };
+    assert.equal(await postAs(proxyPort, 'alice-key', '/v1/messages', headers), 200);
+    assert.equal(await postAs(proxyPort, 'alice-key', '/stream', headers), 200);
+    assert.equal(await postAs(proxyPort, 'alice-key', '/v1/messages', {}), 200);
+
+    const dimensions = dimensionTracker.export();
+    assert.equal(dimensions.project['KarpelesLab/teamclaude'].requests, 2);
+    assert.equal(dimensions.project['KarpelesLab/teamclaude'].inputTokens, 107);
+    assert.equal(dimensions.project['KarpelesLab/teamclaude'].outputTokens, 43);
+    assert.equal(dimensions.ref['pull/123'].requests, 2);
+    assert.equal(dimensions.session['018e3d4f-7a8b-4f00-9f6e-111111111111'].requests, 2);
+    assert.equal(dimensions.session['018e3d4f-7a8b-4f00-9f6e-111111111111'].inputTokens, 107);
+
+    assert.equal(clientTracker.export().alice.requests, 3);
+    assert.equal(clientTracker.export().alice.inputTokens, 114);
+    assert.equal(clientTracker.export().alice.outputTokens, 46);
+    assert.equal(am.accounts[0].usage.totalInputTokens, 7 + 100 + 7);
+    assert.equal(am.accounts[0].usage.totalOutputTokens, 3 + 40 + 3);
   } finally {
     proxy.close();
     upstream.close();
