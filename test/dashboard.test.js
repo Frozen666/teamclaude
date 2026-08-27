@@ -25,7 +25,16 @@ test('dashboard renders filterable session attribution columns', () => {
   const html = renderDashboardHtml();
   assert.match(html, /function renderSessionUsage/);
   assert.match(html, /sessionFilters/);
-  assert.match(html, /'Session', 'Project', 'Client', 'State'/);
+  assert.match(html, /key: 'project', label: 'Project'/);
+  assert.match(html, /key: 'client', label: 'Client'/);
+});
+
+test('dashboard renders sortable usage table headers', () => {
+  const html = renderDashboardHtml();
+  assert.match(html, /function addSortableHeader/);
+  assert.match(html, /sortState/);
+  assert.match(html, /sortRows\('clients'/);
+  assert.match(html, /sortRows\('sessions'/);
 });
 
 test('GET /teamclaude/dashboard serves HTML without a key; other methods take the normal path', async () => {

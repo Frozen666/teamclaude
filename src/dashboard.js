@@ -55,6 +55,8 @@ const PAGE = `<!doctype html>
   table { width: 100%; border-collapse: collapse; }
   th, td { text-align: left; padding: 6px 10px; font-variant-numeric: tabular-nums; }
   th { color: var(--dim); font-size: 12px; font-weight: 500; border-bottom: 1px solid var(--line); }
+  th.sort { cursor: pointer; user-select: none; }
+  th.sort:hover { color: var(--text); }
   td { border-bottom: 1px solid var(--line); }
   tr:last-child td { border-bottom: none; }
   td.num, th.num { text-align: right; }
@@ -99,6 +101,7 @@ const PAGE = `<!doctype html>
   var timer = null;
   var lastStatus = null;
   var sessionFilters = { project: '', client: '' };
+  var sortState = {};
 
   function el(tag, cls, text) {
     var e = document.createElement(tag);
@@ -153,6 +156,49 @@ const PAGE = `<!doctype html>
     return time;
   }
 
+  function sortValue(row, key) {
+    var v = row && row[key];
+    if (v == null) return '';
+    if (key === 'lastUsed' || key === 'firstSeen') return parseTs(v) || 0;
+    if (typeof v === 'boolean') return v ? 1 : 0;
+    if (typeof v === 'number') return v;
+    return String(v).toLowerCase();
+  }
+
+  function compareValues(a, b) {
+    if (typeof a === 'number' && typeof b === 'number') return a - b;
+    return String(a).localeCompare(String(b), undefined, { numeric: true, sensitivity: 'base' });
+  }
+
+  function sortRows(tableId, rows, fallbackKey, fallbackDir) {
+    var state = sortState[tableId] || { key: fallbackKey, dir: fallbackDir || 'desc' };
+    sortState[tableId] = state;
+    var dir = state.dir === 'asc' ? 1 : -1;
+    return rows.slice().sort(function (a, b) {
+      var cmp = compareValues(sortValue(a, state.key), sortValue(b, state.key));
+      if (cmp === 0 && state.key !== fallbackKey) cmp = compareValues(sortValue(a, fallbackKey), sortValue(b, fallbackKey));
+      return cmp * dir;
+    });
+  }
+
+  function addSortableHeader(table, tableId, columns) {
+    var state = sortState[tableId] || {};
+    var hr = el('tr');
+    columns.forEach(function (col) {
+      var th = el('th', (col.num ? 'num ' : '') + 'sort', col.label + (state.key === col.key ? (state.dir === 'asc' ? ' ▲' : ' ▼') : ''));
+      th.addEventListener('click', function () {
+        var current = sortState[tableId] || {};
+        sortState[tableId] = {
+          key: col.key,
+          dir: current.key === col.key && current.dir === 'desc' ? 'asc' : 'desc',
+        };
+        if (lastStatus) render(lastStatus);
+      });
+      hr.appendChild(th);
+    });
+    table.appendChild(hr);
+  }
+
   function quotaRow(label, ratio, resetAt) {
     var row = el('div', 'quota');
     row.appendChild(el('span', 'lbl', label));
@@ -204,21 +250,30 @@ const PAGE = `<!doctype html>
     var names = Object.keys(clients || {});
     if (!names.length) { wrap.style.display = 'none'; return; }
     wrap.style.display = '';
-    names.sort(function (a, b) {
-      var ca = clients[a], cb = clients[b];
-      return ((cb.inputTokens || 0) + (cb.outputTokens || 0)) - ((ca.inputTokens || 0) + (ca.outputTokens || 0));
+    var rows = names.map(function (name) {
+      var c = clients[name] || {};
+      return {
+        name: name,
+        requests: c.requests,
+        inputTokens: c.inputTokens,
+        outputTokens: c.outputTokens,
+        totalTokens: (c.inputTokens || 0) + (c.outputTokens || 0),
+        lastUsed: c.lastUsed,
+      };
     });
+    rows = sortRows('clients', rows, 'totalTokens', 'desc');
     var table = document.getElementById('clients');
     table.textContent = '';
-    var hr = el('tr');
-    ['Client', 'Requests', 'Input tok', 'Output tok', 'Last used'].forEach(function (h, i) {
-      hr.appendChild(el('th', i ? 'num' : '', h));
-    });
-    table.appendChild(hr);
-    names.forEach(function (n) {
-      var c = clients[n];
+    addSortableHeader(table, 'clients', [
+      { key: 'name', label: 'Client' },
+      { key: 'requests', label: 'Requests', num: true },
+      { key: 'inputTokens', label: 'Input tok', num: true },
+      { key: 'outputTokens', label: 'Output tok', num: true },
+      { key: 'lastUsed', label: 'Last used', num: true },
+    ]);
+    rows.forEach(function (c) {
       var tr = el('tr');
-      tr.appendChild(el('td', '', n));
+      tr.appendChild(el('td', '', c.name));
       tr.appendChild(el('td', 'num', fmtNum(c.requests)));
       tr.appendChild(el('td', 'num', fmtNum(c.inputTokens)));
       tr.appendChild(el('td', 'num', fmtNum(c.outputTokens)));
@@ -233,21 +288,30 @@ const PAGE = `<!doctype html>
   }
 
   function renderUsageTable(table, entries, firstHeader) {
-    var names = Object.keys(entries || {});
-    names.sort(function (a, b) {
-      var ca = entries[a], cb = entries[b];
-      return ((cb.inputTokens || 0) + (cb.outputTokens || 0)) - ((ca.inputTokens || 0) + (ca.outputTokens || 0));
+    var tableId = 'dimension:' + firstHeader;
+    var rows = Object.keys(entries || {}).map(function (name) {
+      var c = entries[name] || {};
+      return {
+        name: name,
+        requests: c.requests,
+        inputTokens: c.inputTokens,
+        outputTokens: c.outputTokens,
+        totalTokens: (c.inputTokens || 0) + (c.outputTokens || 0),
+        lastUsed: c.lastUsed,
+      };
     });
+    rows = sortRows(tableId, rows, 'totalTokens', 'desc');
     table.textContent = '';
-    var hr = el('tr');
-    [firstHeader, 'Requests', 'Input tok', 'Output tok', 'Last used'].forEach(function (h, i) {
-      hr.appendChild(el('th', i ? 'num' : '', h));
-    });
-    table.appendChild(hr);
-    names.forEach(function (n) {
-      var c = entries[n];
+    addSortableHeader(table, tableId, [
+      { key: 'name', label: firstHeader },
+      { key: 'requests', label: 'Requests', num: true },
+      { key: 'inputTokens', label: 'Input tok', num: true },
+      { key: 'outputTokens', label: 'Output tok', num: true },
+      { key: 'lastUsed', label: 'Last used', num: true },
+    ]);
+    rows.forEach(function (c) {
       var tr = el('tr');
-      tr.appendChild(el('td', '', n));
+      tr.appendChild(el('td', '', c.name));
       tr.appendChild(el('td', 'num', fmtNum(c.requests)));
       tr.appendChild(el('td', 'num', fmtNum(c.inputTokens)));
       tr.appendChild(el('td', 'num', fmtNum(c.outputTokens)));
@@ -296,12 +360,11 @@ const PAGE = `<!doctype html>
         requests: usage.requests,
         inputTokens: usage.inputTokens,
         outputTokens: usage.outputTokens,
+        totalTokens: (usage.inputTokens || 0) + (usage.outputTokens || 0),
         lastUsed: usage.lastUsed || session.lastSeen,
       };
     });
-    rows.sort(function (a, b) {
-      return ((b.inputTokens || 0) + (b.outputTokens || 0)) - ((a.inputTokens || 0) + (a.outputTokens || 0));
-    });
+    rows = sortRows('sessions', rows, 'totalTokens', 'desc');
 
     var card = el('div', 'card');
     card.style.padding = '0';
@@ -332,11 +395,16 @@ const PAGE = `<!doctype html>
     });
 
     var table = el('table');
-    var hr = el('tr');
-    ['Session', 'Project', 'Client', 'State', 'Requests', 'Input tok', 'Output tok', 'Last used'].forEach(function (h, i) {
-      hr.appendChild(el('th', i >= 4 ? 'num' : '', h));
-    });
-    table.appendChild(hr);
+    addSortableHeader(table, 'sessions', [
+      { key: 'id', label: 'Session' },
+      { key: 'project', label: 'Project' },
+      { key: 'client', label: 'Client' },
+      { key: 'active', label: 'State' },
+      { key: 'requests', label: 'Requests', num: true },
+      { key: 'inputTokens', label: 'Input tok', num: true },
+      { key: 'outputTokens', label: 'Output tok', num: true },
+      { key: 'lastUsed', label: 'Last used', num: true },
+    ]);
     rows.forEach(function (r) {
       var tr = el('tr');
       tr.appendChild(el('td', '', r.id));
