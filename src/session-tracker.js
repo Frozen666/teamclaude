@@ -17,7 +17,7 @@ const SWEEP_INTERVAL_MS = 60 * 1000; // bound growth without an external timer
 
 export class SessionTracker {
   constructor({ knownTtlMs, activeTtlMs, now } = {}) {
-    // id -> { accountIndex, firstSeen, lastSeen, count, inFlight }
+    // id -> { accountIndex, firstSeen, lastSeen, count, inFlight, client, dimensions }
     this.sessions = new Map();
     this.knownTtlMs = knownTtlMs ?? SESSION_KNOWN_TTL_MS;
     this.activeTtlMs = activeTtlMs ?? SESSION_ACTIVE_TTL_MS;
@@ -29,12 +29,13 @@ export class SessionTracker {
   // lastSeen (keeping the session "active"/"known") and, when an account is
   // given, (re)pins the session to it. Throttled sweep keeps the map bounded
   // even in a headless server that never renders status.
-  touch(sessionId, accountIndex = null, now = this._now()) {
+  touch(sessionId, accountIndex = null, now = this._now(), metadata = null) {
     if (!sessionId) return null;
     const s = this._ensure(sessionId, now);
     s.lastSeen = now;
     s.count += 1;
     if (accountIndex != null) s.accountIndex = accountIndex;
+    applyMetadata(s, metadata);
     if (now - this._lastSweep > SWEEP_INTERVAL_MS) this.sweep(now);
     return s;
   }
@@ -43,11 +44,12 @@ export class SessionTracker {
   // flight counts as active (and non-expirable) for the whole request, however
   // long it streams — a 5-minute completion must not drop out of "active" or the
   // load balancer would under-count that account. Paired with endRequest.
-  beginRequest(sessionId, now = this._now()) {
+  beginRequest(sessionId, now = this._now(), metadata = null) {
     if (!sessionId) return null;
     const s = this._ensure(sessionId, now);
     s.inFlight += 1;
     s.lastSeen = now;
+    applyMetadata(s, metadata);
     return s;
   }
 
@@ -62,7 +64,7 @@ export class SessionTracker {
   _ensure(sessionId, now) {
     let s = this.sessions.get(sessionId);
     if (!s) {
-      s = { accountIndex: null, firstSeen: now, lastSeen: now, count: 0, inFlight: 0 };
+      s = { accountIndex: null, firstSeen: now, lastSeen: now, count: 0, inFlight: 0, client: null, dimensions: {} };
       this.sessions.set(sessionId, s);
     }
     return s;
@@ -110,24 +112,67 @@ export class SessionTracker {
     }
   }
 
-  // { known, active, perAccount: { [index]: activeCount } } — for status/TUI.
+  // { known, active, perAccount, items } — for status/TUI/dashboard.
   // Sweeps as it goes so a long-lived headless server stays bounded.
   stats(now = this._now()) {
     this._lastSweep = now;
     let known = 0;
     let active = 0;
     const perAccount = {};
+    const items = [];
     for (const [id, s] of this.sessions) {
       if (this._isExpired(s, now)) {
         this.sessions.delete(id);
         continue;
       }
       known += 1;
-      if (this._isActive(s, now)) {
+      const isActive = this._isActive(s, now);
+      items.push({
+        id,
+        accountIndex: s.accountIndex,
+        active: isActive,
+        inFlight: s.inFlight,
+        requests: s.count,
+        firstSeen: new Date(s.firstSeen).toISOString(),
+        lastSeen: new Date(s.lastSeen).toISOString(),
+        client: s.client || null,
+        dimensions: { ...(s.dimensions || {}) },
+      });
+      if (isActive) {
         active += 1;
         if (s.accountIndex != null) perAccount[s.accountIndex] = (perAccount[s.accountIndex] || 0) + 1;
       }
     }
-    return { known, active, perAccount };
+    items.sort((a, b) => Date.parse(b.lastSeen) - Date.parse(a.lastSeen));
+    return { known, active, perAccount, items };
   }
+}
+
+function applyMetadata(session, metadata) {
+  if (!metadata || typeof metadata !== 'object') return;
+  const client = sanitizeMetadataValue(metadata.client);
+  if (client) session.client = client;
+  if (metadata.dimensions && typeof metadata.dimensions === 'object') {
+    for (const [name, value] of Object.entries(metadata.dimensions)) {
+      const cleanName = sanitizeDimensionName(name);
+      const cleanValue = sanitizeMetadataValue(value);
+      if (cleanName && cleanValue) session.dimensions[cleanName] = cleanValue;
+    }
+  }
+}
+
+function sanitizeDimensionName(value) {
+  if (typeof value !== 'string') return null;
+  const name = value.trim();
+  return /^[A-Za-z][A-Za-z0-9_-]{0,63}$/.test(name) ? name : null;
+}
+
+function sanitizeMetadataValue(value) {
+  if (typeof value !== 'string') return null;
+  const sanitized = value
+    .replace(/\x1b\[[0-?]*[ -/]*[@-~]|\p{C}/gu, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!sanitized) return null;
+  return sanitized.length > 200 ? sanitized.slice(0, 200) : sanitized;
 }

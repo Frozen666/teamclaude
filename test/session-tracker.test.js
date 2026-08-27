@@ -116,6 +116,8 @@ test('stats reports known, active, and per-account active distribution', () => {
   assert.equal(stats.known, 3);
   assert.equal(stats.active, 3);
   assert.deepEqual(stats.perAccount, { 0: 2, 1: 1 });
+  assert.deepEqual(stats.items.map(s => s.id), ['a', 'b', 'c']);
+  assert.deepEqual(stats.items.map(s => s.accountIndex), [0, 0, 1]);
 });
 
 test('stats sweeps forgotten sessions out of the map', () => {
@@ -127,4 +129,28 @@ test('stats sweeps forgotten sessions out of the map', () => {
   st.stats(clock.t);
   assert.equal(st.sessions.has('old'), false);
   assert.equal(st.sessions.has('new'), true);
+});
+
+test('stats includes sanitized client and project metadata for each session', () => {
+  const { clock, now } = fixedClock();
+  const st = new SessionTracker({ now });
+  st.beginRequest('s1', clock.t, {
+    client: 'alice\x1b[31m\nclient',
+    dimensions: {
+      project: 'KarpelesLab/teamclaude',
+      ref: 'pull/123',
+      'bad name': 'ignored',
+    },
+  });
+  st.touch('s1', 2, clock.t, {
+    client: 'alice',
+    dimensions: { project: 'KarpelesLab/teamclaude' },
+  });
+  const [item] = st.stats(clock.t).items;
+  assert.equal(item.id, 's1');
+  assert.equal(item.accountIndex, 2);
+  assert.equal(item.active, true);
+  assert.equal(item.inFlight, 1);
+  assert.equal(item.client, 'alice');
+  assert.deepEqual(item.dimensions, { project: 'KarpelesLab/teamclaude', ref: 'pull/123' });
 });

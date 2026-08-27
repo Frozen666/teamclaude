@@ -510,6 +510,14 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       const sessionId = req.headers['x-claude-code-session-id'] || null;
       const client = req.tcClient ?? forcedClient ?? null;
       const usageDimensions = resolveUsageDimensions(config.proxy, req.headers);
+      const sessionMetadata = {
+        client,
+        dimensions: Object.fromEntries(
+          usageDimensions
+            .filter(d => d.name !== 'session')
+            .map(d => [d.name, d.key]),
+        ),
+      };
       if (!hideActivity) hooks.onRequestStart?.(reqId, { method: req.method, path: req.url, sessionId, pinned: pinnedIndex != null, client });
 
       // Buffer request body (needed to resend on a different account after a 429).
@@ -557,11 +565,11 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       const usageRecorder = createUsageRecorder({ client, clientUsage, dimensions: usageDimensions, dimensionUsage });
       usageRecorder.recordRequest();
 
-      const ctx = { account: null, status: null, tried: new Set(), reauthed: new Set(), model, advisorModel, pinnedIndex, holdBudgetMs: holdMs, sessionId, client, onUsage: usageRecorder.onUsage };
+      const ctx = { account: null, status: null, tried: new Set(), reauthed: new Set(), model, advisorModel, pinnedIndex, holdBudgetMs: holdMs, sessionId, client, sessionMetadata, onUsage: usageRecorder.onUsage };
       // Hold the session "in flight" across the WHOLE request (incl. retries and
       // a multi-minute streaming completion) so it stays counted as active and
       // never expires mid-request.
-      accountManager.beginSession(sessionId);
+      accountManager.beginSession(sessionId, sessionMetadata);
       try {
         await forwardRequest(req, res, body, accountManager, upstream, 0, hooks, reqId, ctx, logDir, sx);
       } catch (err) {
@@ -891,7 +899,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   ctx.account = account.name;
   // Pin this session to the serving account (for affinity) and keep it "active"
   // in the running-sessions readout. Passive when distribution is off.
-  accountManager.recordSession(ctx.sessionId, account.index);
+  accountManager.recordSession(ctx.sessionId, account.index, ctx.sessionMetadata);
   hooks.onRequestRouted?.(reqId, { account: account.name });
 
   // Refresh OAuth token if needed

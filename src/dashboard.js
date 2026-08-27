@@ -58,6 +58,9 @@ const PAGE = `<!doctype html>
   td { border-bottom: 1px solid var(--line); }
   tr:last-child td { border-bottom: none; }
   td.num, th.num { text-align: right; }
+  .filters { display: flex; gap: 8px; flex-wrap: wrap; padding: 8px 10px; border-bottom: 1px solid var(--line); }
+  .filters label { color: var(--dim); font-size: 12px; display: flex; align-items: center; gap: 6px; }
+  .filters select { background: var(--bg); border: 1px solid var(--line); border-radius: 6px; color: var(--text); font: inherit; font-size: 12px; padding: 4px 24px 4px 8px; }
   .usage { color: var(--dim); font-size: 12px; margin-top: 6px; }
   #err { color: var(--bad); margin: 12px 0; display: none; }
   #keybox { display: none; margin: 40px auto; max-width: 420px; text-align: center; }
@@ -94,6 +97,8 @@ const PAGE = `<!doctype html>
   var KEY = 'teamclaude-dashboard-key';
   var POLL_MS = 5000;
   var timer = null;
+  var lastStatus = null;
+  var sessionFilters = { project: '', client: '' };
 
   function el(tag, cls, text) {
     var e = document.createElement(tag);
@@ -251,13 +256,114 @@ const PAGE = `<!doctype html>
     });
   }
 
-  function renderDimensions(dimensions) {
+  function sessionMetaById(sessions) {
+    var out = {};
+    (sessions.items || []).forEach(function (session) {
+      if (session && session.id) out[session.id] = session;
+    });
+    return out;
+  }
+
+  function renderFilter(select, values, value) {
+    select.textContent = '';
+    select.appendChild(el('option', '', 'All'));
+    select.options[0].value = '';
+    values.forEach(function (v) {
+      var option = el('option', '', v);
+      option.value = v;
+      select.appendChild(option);
+    });
+    select.value = values.indexOf(value) === -1 ? '' : value;
+  }
+
+  function uniqSorted(values) {
+    var seen = {};
+    values.forEach(function (v) { if (v) seen[v] = true; });
+    return Object.keys(seen).sort();
+  }
+
+  function renderSessionUsage(entries, sessions) {
+    var meta = sessionMetaById(sessions || {});
+    var rows = Object.keys(entries || {}).map(function (id) {
+      var usage = entries[id] || {};
+      var session = meta[id] || {};
+      var dimensions = session.dimensions || {};
+      return {
+        id: id,
+        project: dimensions.project || '',
+        client: session.client || '',
+        active: !!session.active,
+        requests: usage.requests,
+        inputTokens: usage.inputTokens,
+        outputTokens: usage.outputTokens,
+        lastUsed: usage.lastUsed || session.lastSeen,
+      };
+    });
+    rows.sort(function (a, b) {
+      return ((b.inputTokens || 0) + (b.outputTokens || 0)) - ((a.inputTokens || 0) + (a.outputTokens || 0));
+    });
+
+    var card = el('div', 'card');
+    card.style.padding = '0';
+    var filters = el('div', 'filters');
+    var projectSelect = el('select');
+    var clientSelect = el('select');
+    renderFilter(projectSelect, uniqSorted(rows.map(function (r) { return r.project; })), sessionFilters.project);
+    renderFilter(clientSelect, uniqSorted(rows.map(function (r) { return r.client; })), sessionFilters.client);
+    sessionFilters.project = projectSelect.value;
+    sessionFilters.client = clientSelect.value;
+    projectSelect.addEventListener('change', function () {
+      sessionFilters.project = projectSelect.value;
+      if (lastStatus) render(lastStatus);
+    });
+    clientSelect.addEventListener('change', function () {
+      sessionFilters.client = clientSelect.value;
+      if (lastStatus) render(lastStatus);
+    });
+    filters.appendChild(el('label', '', 'Project'));
+    filters.lastChild.appendChild(projectSelect);
+    filters.appendChild(el('label', '', 'Client'));
+    filters.lastChild.appendChild(clientSelect);
+    card.appendChild(filters);
+
+    rows = rows.filter(function (r) {
+      return (!sessionFilters.project || r.project === sessionFilters.project)
+        && (!sessionFilters.client || r.client === sessionFilters.client);
+    });
+
+    var table = el('table');
+    var hr = el('tr');
+    ['Session', 'Project', 'Client', 'State', 'Requests', 'Input tok', 'Output tok', 'Last used'].forEach(function (h, i) {
+      hr.appendChild(el('th', i >= 4 ? 'num' : '', h));
+    });
+    table.appendChild(hr);
+    rows.forEach(function (r) {
+      var tr = el('tr');
+      tr.appendChild(el('td', '', r.id));
+      tr.appendChild(el('td', '', r.project || '—'));
+      tr.appendChild(el('td', '', r.client || '—'));
+      tr.appendChild(el('td', '', r.active ? 'active' : 'idle'));
+      tr.appendChild(el('td', 'num', fmtNum(r.requests)));
+      tr.appendChild(el('td', 'num', fmtNum(r.inputTokens)));
+      tr.appendChild(el('td', 'num', fmtNum(r.outputTokens)));
+      tr.appendChild(el('td', 'num', r.lastUsed ? fmtAgo(r.lastUsed) : '—'));
+      table.appendChild(tr);
+    });
+    card.appendChild(table);
+    return card;
+  }
+
+  function renderDimensions(dimensions, sessions) {
     var root = document.getElementById('dimensions');
     root.textContent = '';
     Object.keys(dimensions || {}).sort().forEach(function (name) {
       var entries = dimensions[name] || {};
       if (!Object.keys(entries).length) return;
       root.appendChild(el('h2', '', titleForDimension(name)));
+      if (name === 'session') {
+        root.appendChild(renderSessionUsage(entries, sessions));
+        return;
+      }
       var card = el('div', 'card');
       card.style.padding = '4px 6px';
       var table = el('table');
@@ -268,6 +374,7 @@ const PAGE = `<!doctype html>
   }
 
   function render(s) {
+    lastStatus = s;
     var sess = s.sessions || {};
     var up = s.server && s.server.uptimeSeconds != null ? 'up ' + fmtIn(s.server.uptimeSeconds) : '';
     var sum = document.getElementById('summary');
@@ -279,7 +386,7 @@ const PAGE = `<!doctype html>
     acc.textContent = '';
     (s.accounts || []).forEach(function (a) { acc.appendChild(renderAccount(a, s.currentAccount)); });
     renderClients(s.clients);
-    renderDimensions(s.usageDimensions);
+    renderDimensions(s.usageDimensions, sess);
     document.getElementById('foot').textContent = 'refreshes every ' + (POLL_MS / 1000) + 's · ' + new Date().toLocaleTimeString();
   }
 

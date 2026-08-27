@@ -271,6 +271,15 @@ test('usage dimensions: tokens are booked against project and session for JSON a
     assert.equal(clientTracker.export().alice.outputTokens, 46);
     assert.equal(am.accounts[0].usage.totalInputTokens, 7 + 100 + 7);
     assert.equal(am.accounts[0].usage.totalOutputTokens, 3 + 40 + 3);
+
+    const session = am.getStatus().sessions.items.find(s => s.id === headers['x-claude-code-session-id']);
+    assert.equal(session.client, 'alice');
+    assert.equal(session.accountIndex, 0);
+    assert.equal(session.requests, 2);
+    assert.deepEqual(session.dimensions, {
+      project: 'KarpelesLab/teamclaude',
+      ref: 'pull/123',
+    });
   } finally {
     proxy.close();
     upstream.close();

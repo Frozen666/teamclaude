@@ -136,7 +136,7 @@ teamclaude help              # Show all commands
 
 ## Status dashboard (browser)
 
-`GET /teamclaude/dashboard` serves a self-contained HTML page rendering the same data as `teamclaude status`: per-account quota bars (session/weekly, plus Sonnet/Fable buckets where present), rotation state, active sessions — refreshed every few seconds.
+`GET /teamclaude/dashboard` serves a self-contained HTML page rendering the same data as `teamclaude status`: per-account quota bars (session/weekly, plus Sonnet/Fable buckets where present), rotation state, active sessions — refreshed every few seconds. When usage dimensions are configured, the session usage table also shows the project and client for each session and can filter by either field.
 
 ```
 http://localhost:3456/teamclaude/dashboard

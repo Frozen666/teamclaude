@@ -21,6 +21,13 @@ test('dashboard page is self-contained: no external resources', () => {
   assert.match(html, /fetch\('\/teamclaude\/status'/);
 });
 
+test('dashboard renders filterable session attribution columns', () => {
+  const html = renderDashboardHtml();
+  assert.match(html, /function renderSessionUsage/);
+  assert.match(html, /sessionFilters/);
+  assert.match(html, /'Session', 'Project', 'Client', 'State'/);
+});
+
 test('GET /teamclaude/dashboard serves HTML without a key; other methods take the normal path', async () => {
   const upstream = http.createServer((req, res) => {
     res.writeHead(200, { 'content-type': 'application/json' });

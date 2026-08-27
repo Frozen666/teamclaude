@@ -364,22 +364,22 @@ export class AccountManager {
   /** Record that a session's request was served by an account (always on, even
    * when distribution is off — the readout is passive). This is what pins a
    * session for future affinity. */
-  recordSession(sessionId, accountIndex) {
-    if (sessionId) this.sessionTracker.touch(sessionId, accountIndex);
+  recordSession(sessionId, accountIndex, metadata = null) {
+    if (sessionId) this.sessionTracker.touch(sessionId, accountIndex, undefined, metadata);
   }
 
   /** Mark a session request as in flight / finished. Paired around the whole
    * client request (including retries) so a long streaming completion keeps the
    * session counted as active for its full duration. */
-  beginSession(sessionId) {
-    if (sessionId) this.sessionTracker.beginRequest(sessionId);
+  beginSession(sessionId, metadata = null) {
+    if (sessionId) this.sessionTracker.beginRequest(sessionId, undefined, metadata);
   }
 
   endSession(sessionId) {
     if (sessionId) this.sessionTracker.endRequest(sessionId);
   }
 
-  /** { known, active, perAccount } session counts for status/TUI. */
+  /** { known, active, perAccount, items } session counts for status/TUI. */
   sessionStats() {
     return this.sessionTracker.stats();
   }
