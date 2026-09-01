@@ -35,6 +35,21 @@ test('renderStatus prints core status', () => {
   assert.match(output, /2 req, 1.5k tok/);
 });
 
+test('renderStatus shows rejected unified quota status even when usage is zero', () => {
+  const status = sampleStatus();
+  status.accounts[0].quota = {
+    unifiedStatus: 'rejected',
+    unified5h: 0,
+    unified5hReset: now + 60_000,
+    unified7d: 0,
+    unified7dReset: now + 600_000,
+  };
+
+  const output = renderStatus(status, { color: false, now });
+  assert.match(output, /active \/ quota rejected/);
+  assert.match(output, /Session\s+\[░+\] 0% reset 1m/);
+});
+
 test('renderStatus shows the sessions line and per-account session count when present', () => {
   const status = sampleStatus();
   status.sessions = { known: 3, active: 2, perAccount: { 0: 2 }, distribute: true };

@@ -557,6 +557,11 @@ export class AccountManager {
     }
 
     if (account.status === 'exhausted' || account.status === 'error') return false;
+    this._clearExpiredQuotas(account);
+    // Treat a rejected unified status as authoritative only while it is backed
+    // by a spent tracked quota bucket. _clearExpiredQuotas also clears stale
+    // rejected status when known utilization counters are below threshold.
+    if (account.quota?.unifiedStatus === 'rejected') return false;
     // Model-scoped: _isNearQuota checks the shared 5h bucket plus only the weekly
     // bucket that governs this model, so a spent Fable/Sonnet bucket bars just
     // that family — the account still serves every other model normally.
@@ -614,6 +619,7 @@ export class AccountManager {
       if (account.status === 'error') return { eligible: false, reason: 'in an error state and needs a re-login' };
       if (account.status === 'exhausted') return { eligible: false, reason: 'out of quota' };
       if (account.status === 'throttled') return { eligible: false, reason: 'rate-limited' };
+      if (account.quota?.unifiedStatus === 'rejected') return { eligible: false, reason: 'quota status rejected' };
       return { eligible: false, reason: 'at or above the switch threshold' };
     }
     // Healthy, but a higher-priority account preempts it on the next selection.
@@ -853,8 +859,23 @@ export class AccountManager {
       q.resetsAt = null;
       changed = true;
     }
+    if (this._clearStaleUnifiedStatus(account)) changed = true;
 
     return { changed, session };
+  }
+
+  _clearStaleUnifiedStatus(account) {
+    const q = account.quota;
+    if (q.unifiedStatus !== 'rejected') return false;
+    const utilization = [
+      q.unified5h,
+      q.unified7d,
+      q.unified7dSonnet,
+      q.unified7dFable,
+    ].filter(value => typeof value === 'number' && Number.isFinite(value));
+    if (!utilization.length || utilization.some(value => value >= this.switchThreshold)) return false;
+    q.unifiedStatus = null;
+    return true;
   }
 
   /**
@@ -1362,6 +1383,7 @@ export class AccountManager {
    * Return a status summary of all accounts (safe to expose, no credentials).
    */
   getStatus() {
+    this.refreshExpiredQuotas();
     const sessions = this.sessionTracker.stats();
     return {
       currentAccount: this.accounts[this.currentIndex]?.name,
