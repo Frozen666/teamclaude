@@ -37,6 +37,13 @@ test('dashboard renders sortable usage table headers', () => {
   assert.match(html, /sortRows\('sessions'/);
 });
 
+test('dashboard renders unified quota status as its own account badge', () => {
+  const html = renderDashboardHtml();
+  assert.match(html, /a\.quota\.unifiedStatus/);
+  assert.match(html, /quota ' \+ a\.quota\.unifiedStatus/);
+  assert.match(html, /\.badge\.error, \.badge\.exhausted, \.badge\.rejected/);
+});
+
 test('GET /teamclaude/dashboard serves HTML without a key; other methods take the normal path', async () => {
   const upstream = http.createServer((req, res) => {
     res.writeHead(200, { 'content-type': 'application/json' });

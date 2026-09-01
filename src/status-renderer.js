@@ -167,6 +167,16 @@ function formatAccountStatus(account, now, paint) {
         : status;
   parts.push(colored);
 
+  const quotaStatus = account.quota?.unifiedStatus;
+  if (quotaStatus) {
+    const quota = quotaStatus === 'rejected'
+      ? paint.red(`quota ${quotaStatus}`)
+      : quotaStatus === 'allowed_warning'
+        ? paint.yellow(`quota ${quotaStatus}`)
+        : paint.green(`quota ${quotaStatus}`);
+    parts.push(quota);
+  }
+
   const throttleAt = parseTs(account.rateLimitedUntil);
   if (throttleAt && throttleAt > now) {
     parts.push(`throttle ${formatDuration(throttleAt - now)}`);

@@ -43,7 +43,9 @@ const PAGE = `<!doctype html>
   .badge { font-size: 12px; padding: 1px 8px; border-radius: 999px; border: 1px solid var(--line); }
   .badge.active { color: var(--ok); border-color: var(--ok); }
   .badge.throttled { color: var(--warn); border-color: var(--warn); }
-  .badge.error, .badge.exhausted { color: var(--bad); border-color: var(--bad); }
+  .badge.error, .badge.exhausted, .badge.rejected { color: var(--bad); border-color: var(--bad); }
+  .badge.allowed_warning { color: var(--warn); border-color: var(--warn); }
+  .badge.allowed { color: var(--ok); border-color: var(--ok); }
   .badge.current { color: var(--accent); border-color: var(--accent); }
   .quota { display: grid; grid-template-columns: 64px 1fr 170px; gap: 8px; align-items: center; margin-top: 6px; }
   .quota .lbl { color: var(--dim); font-size: 12px; }
@@ -225,6 +227,9 @@ const PAGE = `<!doctype html>
     head.appendChild(el('span', 'tag', a.type + ' · prio ' + (a.priority || 0)));
     if (a.name === current) head.appendChild(el('span', 'badge current', 'current'));
     head.appendChild(el('span', 'badge ' + (a.status || ''), a.disabled ? 'disabled' : (a.status || 'unknown')));
+    if (a.quota && a.quota.unifiedStatus) {
+      head.appendChild(el('span', 'badge ' + a.quota.unifiedStatus, 'quota ' + a.quota.unifiedStatus));
+    }
     if (a.sessions) head.appendChild(el('span', 'tag', a.sessions + ' active session' + (a.sessions > 1 ? 's' : '')));
     card.appendChild(head);
     var q = a.quota || {};

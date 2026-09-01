@@ -66,3 +66,59 @@ test('a probe refreshing healthy quota restores normal (non-throttled) selection
   // Now the account is available the normal way, with no throttle gating.
   assert.equal(am.getActiveAccount().name, 'a');
 });
+
+test('rejected unified quota status does not block routing after tracked utilization reset', () => {
+  const am = new AccountManager([oauth('rejected'), oauth('healthy')], 0.98);
+  am.accounts[0].quota.unifiedStatus = 'rejected';
+  am.accounts[0].quota.unified5h = 0;
+  am.accounts[0].quota.unified7d = 0;
+  am.accounts[1].quota.unifiedStatus = 'allowed';
+  am.accounts[1].quota.unified5h = 0.01;
+  am.accounts[1].quota.unified7d = 0.01;
+
+  assert.equal(am.getActiveAccount().name, 'rejected');
+  assert.equal(am.accounts[0].quota.unifiedStatus, null);
+  assert.deepEqual(am.eligibility(0), { eligible: true });
+});
+
+test('status snapshots clear stale rejected status after tracked utilization reset', () => {
+  const am = new AccountManager([oauth('rejected')], 0.98);
+  am.accounts[0].quota.unifiedStatus = 'rejected';
+  am.accounts[0].quota.unified5h = 0;
+  am.accounts[0].quota.unified7d = 0;
+
+  const status = am.getStatus();
+  assert.equal(status.accounts[0].quota.unifiedStatus, null);
+});
+
+test('rejected unified quota status blocks normal routing while tracked utilization is spent', () => {
+  const am = new AccountManager([oauth('rejected'), oauth('healthy')], 0.98);
+  am.accounts[0].quota.unifiedStatus = 'rejected';
+  am.accounts[0].quota.unified5h = 0.99;
+  am.accounts[0].quota.unified7d = 0;
+  am.accounts[1].quota.unifiedStatus = 'allowed';
+  am.accounts[1].quota.unified5h = 0.01;
+  am.accounts[1].quota.unified7d = 0.01;
+
+  assert.equal(am.getActiveAccount().name, 'healthy');
+  assert.deepEqual(am.eligibility(0), { eligible: false, reason: 'quota status rejected' });
+});
+
+test('spent rejected unified quota status is still probeable so stale state can recover', () => {
+  const am = new AccountManager([oauth('rejected')], 0.98);
+  am.accounts[0].quota.unifiedStatus = 'rejected';
+  am.accounts[0].quota.unified5h = 0.99;
+  am.accounts[0].quota.unified7d = 0;
+
+  const probe = am.getActiveAccount();
+  assert.ok(probe, 'expected a revalidation probe, not a permanent local refusal');
+  assert.equal(probe.name, 'rejected');
+  assert.equal(am.getActiveAccount(), null, 'second request inside probe interval still refuses');
+
+  am.updateQuota(0, {
+    'anthropic-ratelimit-unified-status': 'allowed',
+    'anthropic-ratelimit-unified-5h-utilization': '0.02',
+    'anthropic-ratelimit-unified-7d-utilization': '0.03',
+  });
+  assert.equal(am.getActiveAccount().name, 'rejected');
+});
