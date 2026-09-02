@@ -151,7 +151,7 @@ test('per-client usage: tokens are booked against the key that authenticated', a
   }
 });
 
-test('per-client usage: a wrong key is still rejected for remote-shaped requests', async () => {
+test('per-client usage: an invalid key on a loopback call neither fails the request nor mis-attributes it', async () => {
   // The gate itself is exercised through resolveClientAuth (unit-tested above);
   // over real sockets every test connection is loopback and thus exempt. What
   // MUST hold end-to-end is that an invalid key on a loopback call neither
@@ -170,4 +170,26 @@ test('per-client usage: a wrong key is still rejected for remote-shaped requests
     proxy.close();
     upstream.close();
   }
+});
+
+test('resolveClientAuth ignores nameless or keyless entries and keeps the rest', () => {
+  const cfg = { clientKeys: [{ key: 'nameless' }, { name: 'ok', key: 'k-ok' }, { name: 'ok', key: 'k-ok2' }] };
+  const errors = [];
+  const orig = console.error; console.error = (...a) => errors.push(a.join(' '));
+  try {
+    assert.deepEqual(resolveClientAuth(cfg, 'nameless'), { ok: false, client: null });
+    assert.deepEqual(resolveClientAuth(cfg, 'k-ok'), { ok: true, client: 'ok' });
+    assert.deepEqual(resolveClientAuth(cfg, 'k-ok2'), { ok: true, client: 'ok' });
+    resolveClientAuth(cfg, 'k-ok'); // same array: no second round of warnings
+  } finally { console.error = orig; }
+  assert.equal(errors.filter(e => /without a name and a key/.test(e)).length, 1);
+  assert.equal(errors.filter(e => /duplicate name "ok"/.test(e)).length, 1);
+});
+
+test('export() keeps a hostile client name as a plain key', () => {
+  const t = new ClientUsageTracker();
+  t.record('__proto__', { requests: 1 });
+  const out = t.export();
+  assert.equal(Object.getPrototypeOf(out), null);
+  assert.equal(out['__proto__'].requests, 1);
 });

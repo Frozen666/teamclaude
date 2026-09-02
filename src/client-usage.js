@@ -47,7 +47,9 @@ export class ClientUsageTracker {
    * (lastUsed as ISO string, matching how the status endpoint reports times).
    */
   export() {
-    const out = {};
+    // Null prototype: names are operator-configured, but a name like
+    // `__proto__` must still land as a plain key rather than on the prototype.
+    const out = Object.create(null);
     for (const [name, c] of this.clients) {
       out[name] = {
         requests: c.requests,
