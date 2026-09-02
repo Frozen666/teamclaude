@@ -47,8 +47,10 @@ export class ClientUsageTracker {
    * (lastUsed as ISO string, matching how the status endpoint reports times).
    */
   export() {
-    // Null prototype: names are operator-configured, but a name like
-    // `__proto__` must still land as a plain key rather than on the prototype.
+    // Built on a null prototype and copied out with fromEntries, so a name like
+    // `__proto__` lands as an own key of a plain object instead of on its
+    // prototype (names are operator-configured, but the cost of getting this
+    // wrong is silent loss of the row).
     const out = Object.create(null);
     for (const [name, c] of this.clients) {
       out[name] = {
@@ -58,7 +60,7 @@ export class ClientUsageTracker {
         lastUsed: c.lastUsed ? new Date(c.lastUsed).toISOString() : null,
       };
     }
-    return out;
+    return Object.fromEntries(Object.entries(out));
   }
 
   /**

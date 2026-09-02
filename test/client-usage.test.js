@@ -190,6 +190,7 @@ test('export() keeps a hostile client name as a plain key', () => {
   const t = new ClientUsageTracker();
   t.record('__proto__', { requests: 1 });
   const out = t.export();
-  assert.equal(Object.getPrototypeOf(out), null);
+  assert.ok(Object.hasOwn(out, '__proto__'), 'an own key, not the prototype');
   assert.equal(out['__proto__'].requests, 1);
+  assert.equal(Object.getPrototypeOf(out), Object.prototype, 'still a plain object for deepEqual/JSON');
 });
