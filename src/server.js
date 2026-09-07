@@ -745,7 +745,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       // are dropped with the other proxy-control headers.
       const stripHeaders = usageDimensionHeaderNames(config.proxy);
 
-      const ctx = { account: null, status: null, tried: new Set(), reauthed: new Set(), model, advisorModel, pinnedIndex, provider: providerForPath(req.url), holdBudgetMs: holdMs, sessionId, client, onUsage: usageRecorder.onUsage, stripHeaders, logLevel: resolveLogLevel(config), logMaxBodyBytes: resolveLogMaxBodyBytes(config) };
+      const ctx = { account: null, status: null, tried: new Set(), reauthed: new Set(), model, advisorModel, pinnedIndex, provider: providerForPath(req.url), holdBudgetMs: holdMs, sessionId, client, delivered: false, abandoned: false, onUsage: usageRecorder.onUsage, stripHeaders, logLevel: resolveLogLevel(config), logMaxBodyBytes: resolveLogMaxBodyBytes(config) };
       // Hold the session "in flight" across the WHOLE request (incl. retries and
       // a multi-minute streaming completion) so it stays counted as active and
       // never expires mid-request.
@@ -767,7 +767,12 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
           res.end(JSON.stringify({ type: 'error', error: { type: 'proxy_error', message: 'Internal proxy error' } }));
         }
       } finally {
-        accountManager.endSession(sessionId);
+        // true = the client got an answer it can act on; false = it got nothing;
+        // null = it walked away, which is neither and must not count against the
+        // session. Abandonment is observed where it happens, never inferred here:
+        // the proxy destroys the socket itself on a dead stream, so a clientGone
+        // check at this point would reclassify the worst failure as "the user left".
+        accountManager.endSession(sessionId, ctx.delivered ? true : (ctx.abandoned ? null : false));
         // Cleared BEFORE the hook, because the hook can throw: leaving the entry
         // marked open would send the outer catch to call that same throwing hook
         // a second time for one request.
@@ -863,6 +868,14 @@ function reportFailure(...args) {
  * `drain` or a `close` that has already happened and will not happen again, so
  * the handler never returns and its activity entry never closes.
  */
+// A status the client can act on: upstream said something about THIS request.
+// A 4xx IS an answer — it tells the client something true about what it sent,
+// and a session getting legitimate 400s is working, not starving. A 429 is a
+// refusal to answer and a 5xx is a failure to.
+function answeredStatus(status) {
+  return status < 500 && status !== 429;
+}
+
 function clientGone(res) {
   return !!res.destroyed || !!res.stream?.destroyed;
 }
@@ -1501,7 +1514,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       ctx.holdBudgetMs -= waitMs;
       console.log(`[TeamClaude] All accounts exhausted — holding connection, retry in ${Math.ceil(waitMs / 1000)}s (${Math.ceil(ctx.holdBudgetMs / 1000)}s budget left)`);
       await new Promise(resolve => setTimeout(resolve, waitMs));
-      if (clientGone(res)) return;
+      if (clientGone(res)) { ctx.abandoned = true; return; }
       return forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir, sx, route);
     }
 
@@ -1510,7 +1523,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       ctx.exhaustedRetries = exhaustedRetries + 1;
       console.log(`[TeamClaude] All accounts exhausted — waiting ${retryAfter}s before retry`);
       await new Promise(resolve => setTimeout(resolve, retryAfter * 1000));
-      if (clientGone(res)) return;
+      if (clientGone(res)) { ctx.abandoned = true; return; }
       return forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir, sx, route);
     }
     res.writeHead(429, {
@@ -1700,7 +1713,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
           accountManager.markRateLimited(account.index, hold);
         }
         ctx.tried.add(account.index);
-        if (clientGone(res)) return;
+        if (clientGone(res)) { ctx.abandoned = true; return; }
         return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
       }
 
@@ -1758,7 +1771,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
           ctx.rateLimitHopped = true;
           ctx.tried.add(account.index);
           console.log(`[TeamClaude] Rate-limit 429 on "${account.name}" — failing over once to idle account "${alt.name}"`);
-          if (clientGone(res)) return;
+          if (clientGone(res)) { ctx.abandoned = true; return; }
           return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
         }
       } else if (ctx.rateLimitHopped) {
@@ -1774,7 +1787,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       // 429ing upstream can't loop forever through sx.
       if (switchingToSx && retryCount < maxRetries) {
         console.log(`[TeamClaude] 429 on "${account.name}" — retrying via sx.org (fresh egress IP)`);
-        if (clientGone(res)) return;
+        if (clientGone(res)) { ctx.abandoned = true; return; }
         return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, nextUseSx);
       }
 
@@ -1784,7 +1797,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       if (retryAfter <= RATE_LIMIT_ABSORB_MAX_SECONDS && retryCount < maxRetries) {
         console.log(`[TeamClaude] Rate-limit 429 on "${account.name}" — waiting ${retryAfter}s, retrying same account (no switch)`);
         await new Promise(resolve => setTimeout(resolve, retryAfter * 1000));
-        if (clientGone(res)) return;
+        if (clientGone(res)) { ctx.abandoned = true; return; }
         return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, nextUseSx);
       }
 
@@ -1834,7 +1847,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
         ctx.serverErrorHopped = true;
         ctx.tried.add(account.index);
         console.log(`[TeamClaude] Upstream ${upstreamRes.status} on "${account.name}" — failing over once to "${alt.name}"`);
-        if (clientGone(res)) return;
+        if (clientGone(res)) { ctx.abandoned = true; return; }
         return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
       }
     }
@@ -1873,7 +1886,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       await upstreamRes.body?.cancel();
       console.log(`[TeamClaude] 401 on "${account.name}" — token rejected; forcing refresh and retrying`);
       await accountManager.ensureTokenFresh(account.index, true);
-      if (clientGone(res)) return;
+      if (clientGone(res)) { ctx.abandoned = true; return; }
       return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
     }
 
@@ -1901,6 +1914,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       const l = getLog();
       if (l) { l.body('RESPONSE BODY', null); l.end(); }
       res.end();
+      ctx.delivered = answeredStatus(upstreamRes.status);
       return;
     }
 
@@ -1914,6 +1928,12 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       const bw = l ? l.bodyWriter('RESPONSE BODY (streamed)', contentType) : null;
       try {
         await streamResponse(upstreamRes.body, res, account.index, accountManager, bw, ctx.onUsage, ctx.sessionId, ctx.model);
+        // Reached only when the stream completed. A stream that dies upstream
+        // throws out of streamResponse, so it never marks itself delivered —
+        // which is the failure the token counters cannot see, since a stream
+        // that emitted message_start has already recorded a usage report.
+        if (clientGone(res)) ctx.abandoned = true;
+        else ctx.delivered = answeredStatus(upstreamRes.status);
       } finally {
         // Also on the failure path: without the note a capped body reads as a
         // stream that simply stopped, which is the other thing that happens here.
@@ -1926,6 +1946,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       const l = getLog();
       if (l) { l.body('RESPONSE BODY', buf, contentType); l.end(); }
       res.end(buf);
+      ctx.delivered = answeredStatus(upstreamRes.status);
     }
   } catch (err) {
     console.error(`[TeamClaude] Upstream error (account "${account.name}"):`, describeConnectError(err));

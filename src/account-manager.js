@@ -896,8 +896,19 @@ export class AccountManager {
     if (sessionId) this.sessionTracker.beginRequest(sessionId, undefined, metadata);
   }
 
-  endSession(sessionId) {
-    if (sessionId) this.sessionTracker.endRequest(sessionId);
+  /**
+   * `usable`: true if the client got an answer it can act on, false if it got
+   * nothing, null if it walked away (which is neither). Defaults to null so an
+   * existing caller records no outcome.
+   *
+   * Recorded BEFORE endRequest: while the request is still in flight the
+   * session cannot be swept, so the outcome always lands on the record that
+   * produced it.
+   */
+  endSession(sessionId, usable = null) {
+    if (!sessionId) return;
+    if (usable !== null) this.sessionTracker.recordOutcome(sessionId, usable);
+    this.sessionTracker.endRequest(sessionId);
   }
 
   /** { known, active, perAccount } session counts for status/TUI. */
