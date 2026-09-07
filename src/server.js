@@ -592,6 +592,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
         const state = await egress.waitUntilPinned({ isAborted: () => clientGone(res) });
         if (clientGone(res)) return;
         if (!state.ok) {
+          recordEarlyOutcome(accountManager, req.headers['x-claude-code-session-id'] || null, req.url, false);
           res.writeHead(503, { 'Content-Type': 'application/json', 'retry-after': '30' });
           res.end(JSON.stringify({
             type: 'error',
@@ -649,6 +650,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
           if (!hideActivity) hooks.onRequestEnd?.(reqId, { method: req.method, path: req.url, account: `(unknown pin: "${shown}")`, status: 404, model: null, sessionId, pinned: false });
           res.writeHead(404, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ type: 'error', error: { type: 'not_found_error', message: `Unknown account pin "${shown}"` } }));
+          recordEarlyOutcome(accountManager, sessionId, req.url, true);
           return;
         }
         req.url = afterPrefix.slice(tokenEnd);
@@ -668,6 +670,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
           if (!hideActivity) hooks.onRequestEnd?.(reqId, { method: req.method, path: req.url, account: `(unknown pin: "${safeLine(forcedPin)}")`, status: 404, model: null, sessionId, pinned: false });
           res.writeHead(404, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ type: 'error', error: { type: 'not_found_error', message: `Unknown account pin "${forcedPin}" (from TC_ACCT)` } }));
+          recordEarlyOutcome(accountManager, sessionId, req.url, true);
           return;
         }
       }
@@ -719,6 +722,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
           res.writeHead(400, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ type: 'error', error: { type: 'invalid_request_error', message: `Model "${model}" is blocked by teamclaude (matched "${blockedBy}").` } }));
         }
+        recordEarlyOutcome(accountManager, sessionId, req.url, true);
         openEntry = null;   // this path owns the close below; the outer catch must not repeat it
         hooks.onRequestEnd?.(reqId, { method: req.method, path: req.url, account: '(blocked)', status: 400, model, sessionId });
         return;
@@ -772,7 +776,13 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
         // session. Abandonment is observed where it happens, never inferred here:
         // the proxy destroys the socket itself on a dead stream, so a clientGone
         // check at this point would reclassify the worst failure as "the user left".
-        accountManager.endSession(sessionId, ctx.delivered ? true : (ctx.abandoned ? null : false));
+        // null = record nothing: the client walked away (neither an answer nor a
+        // starvation), or this was not a completion at all. Abandonment is
+        // observed where it happens, never inferred here: the proxy destroys the
+        // socket itself on a dead stream, so a clientGone check at this point
+        // would reclassify the worst failure as "the user left".
+        accountManager.endSession(sessionId,
+          !isCompletionPath(req.url) ? null : (ctx.delivered ? true : (ctx.abandoned ? null : false)));
         // Cleared BEFORE the hook, because the hook can throw: leaving the entry
         // marked open would send the outer catch to call that same throwing hook
         // a second time for one request.
@@ -873,7 +883,31 @@ function reportFailure(...args) {
 // and a session getting legitimate 400s is working, not starving. A 429 is a
 // refusal to answer and a 5xx is a failure to.
 function answeredStatus(status) {
-  return status < 500 && status !== 429;
+  // 401 is excluded on purpose. It is about the credential the PROXY injected,
+  // which the client never sees and cannot act on — a fleet whose keys have all
+  // been rotated out answers 401 to everything, forever, and that is the
+  // canonical starving session rather than an answered one.
+  return status < 500 && status !== 429 && status !== 401;
+}
+
+// Only a completion is something a session can starve for. Claude Code sends
+// `count_tokens` under the SAME session id as the completions it is sizing up,
+// and that endpoint keeps working when completions do not — so counting it
+// would let a healthy trickle reset the streak of a session that is getting
+// nothing. Measured before this guard: ten failed completions interleaved with
+// their count_tokens calls reported a streak of one.
+// Outcomes for the exits that return BEFORE beginSession. They never open an
+// in-flight hold, so they cannot use the ctx flags — but a session that is
+// answered promptly (a blocked model, an unknown pin) must still clear a stale
+// streak, and one the proxy refuses to send at all (egress unpinned) must still
+// count as getting nothing.
+function recordEarlyOutcome(accountManager, sessionId, url, usable) {
+  if (sessionId && isCompletionPath(url)) accountManager.endSession(sessionId, usable);
+}
+
+function isCompletionPath(url) {
+  const path = String(url || '').split('?')[0];
+  return path.endsWith('/v1/messages') || path.endsWith('/responses');
 }
 
 function clientGone(res) {
@@ -1433,6 +1467,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // Named plainly: a pin that cannot serve is a configuration mistake, and the
     // exhausted-account response would send the operator looking at quota.
     ctx.status = 400;
+    ctx.delivered = true;   // a configuration mistake, answered plainly
     res.writeHead(400, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({
       type: 'error',
@@ -1643,7 +1678,11 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // only until the response headers arrive — long enough to stagger the burst,
     // then released so streaming bodies don't tie up concurrency. Fail-open: a
     // client that disconnects while waiting just drops out.
-    if (!await accountManager.admit(account.index, () => clientGone(res))) return;
+    // admit() returns false only when isAborted() fires, and isAborted IS
+    // clientGone — so this is a pure abandonment exit. It fires while an account
+    // is paused or ramping, which is exactly when clients give up, so leaving it
+    // unmarked clustered false positives where the signal is read hardest.
+    if (!await accountManager.admit(account.index, () => clientGone(res))) { ctx.abandoned = true; return; }
     // This request may have selected the account before another in-flight request
     // observed an entitlement denial. Re-check after admission, when the queued
     // request is about to send, so the cooldown also drains that preselected

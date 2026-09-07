@@ -180,6 +180,24 @@ export class SessionTracker {
    *     map the idle window exists to drain. A report for a session that is gone
    *     is dropped.
    */
+  recordTokens(sessionId, bucket, usage, now = this._now()) {
+    const s = this._live(sessionId, now);
+    if (!s || !usage || !bucket) return null;
+    const t = s.tokens.get(bucket) || setAndReturn(s.tokens, bucket, emptyTokens());
+    const read = num(usage.cache_read_input_tokens);
+    const creation = num(usage.cache_creation_input_tokens);
+    const input = num(usage.input_tokens);
+    t.cacheRead += read;
+    t.cacheCreation += creation;
+    t.input += input;
+    t.output += num(usage.output_tokens);
+    // Only a report that carries the input side describes a context. A
+    // `message_delta` carries output alone and would otherwise reset this to 0.
+    if (read || creation || input) t.context = read + creation + input;
+    t.reports += 1;
+    return t;
+  }
+
   /**
    * Record how ONE client request ended. `usable` true resets the streak,
    * false advances it; an outcome nobody can attribute — the client walked
@@ -200,24 +218,6 @@ export class SessionTracker {
     if (!s) return null;
     s.starved = usable ? 0 : s.starved + 1;
     return s.starved;
-  }
-
-  recordTokens(sessionId, bucket, usage, now = this._now()) {
-    const s = this._live(sessionId, now);
-    if (!s || !usage || !bucket) return null;
-    const t = s.tokens.get(bucket) || setAndReturn(s.tokens, bucket, emptyTokens());
-    const read = num(usage.cache_read_input_tokens);
-    const creation = num(usage.cache_creation_input_tokens);
-    const input = num(usage.input_tokens);
-    t.cacheRead += read;
-    t.cacheCreation += creation;
-    t.input += input;
-    t.output += num(usage.output_tokens);
-    // Only a report that carries the input side describes a context. A
-    // `message_delta` carries output alone and would otherwise reset this to 0.
-    if (read || creation || input) t.context = read + creation + input;
-    t.reports += 1;
-    return t;
   }
 
   // A known, non-expired session's record, or null. Never creates one, and

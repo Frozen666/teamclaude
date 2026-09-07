@@ -60,6 +60,12 @@ async function run(handler, n, { accounts = 1, before } = {}) {
   } finally { shutdown(proxy, upstream); }
 }
 
+/** Drive the session to a known non-zero streak, so a later assertion of 0
+ *  proves a RESET rather than merely the initial value: every healthy-shape
+ *  test here previously passed on the default and survived deleting the
+ *  feature outright. */
+async function prime(port, n = 2) { for (let i = 0; i < n; i++) await post(port); }
+
 const json = (status, body) => (req, res) => {
   res.writeHead(status, { 'content-type': 'application/json' });
   res.end(JSON.stringify(body));
@@ -85,32 +91,75 @@ test('an outcome for a session the tracker has forgotten creates nothing', () =>
 
 // ── the healthy shapes the first attempt accused ────────────
 
-test('count_tokens answers correctly while reporting no usage, and does not starve', async () => {
-  const upstream = http.createServer(json(200, { input_tokens: 42 }));
+test('count_tokens is invisible to the streak — it neither starves nor rescues', async () => {
+  // Claude Code sends count_tokens under the SAME session id as the completions
+  // it is sizing up, and that endpoint keeps working when completions do not.
+  // Counting it either way is wrong: as a failure it accuses a healthy session,
+  // as a success it rescues a starving one.
+  let completionsFail = false;
+  const upstream = http.createServer((req, res) =>
+    (req.url.includes('count_tokens') ? json(200, { input_tokens: 42 })
+      : completionsFail ? json(500, { error: 'boom' }) : json(200, { ok: true }))(req, res));
   const upstreamPort = await listen(upstream);
   const am = fleet();
   const proxy = createProxyServer(am, { proxy: {}, upstream: `http://127.0.0.1:${upstreamPort}` });
   const port = await listen(proxy);
   try {
     for (let i = 0; i < 6; i++) await post(port, { model: 'claude-opus-5' }, '/v1/messages/count_tokens');
-    const row = item(am);
-    assert.equal(row.starved, 0, 'six good answers are not starvation');
-    assert.equal(Object.keys(row.tokens).length, 0, 'and they report no usage — the old false positive');
+    assert.equal(item(am).starved, 0, 'a healthy count_tokens session is not starving');
+
+    // THE case this counter exists for: failing completions interleaved with the
+    // successful count_tokens calls that accompany them. Before the guard this
+    // reported a streak of one, and the banner would never have fired.
+    completionsFail = true;
+    for (let i = 0; i < 6; i++) {
+      await post(port, { model: 'claude-opus-5' }, '/v1/messages/count_tokens');
+      await post(port);
+    }
+    assert.equal(item(am).starved, 6, 'a good count_tokens must not reset the streak');
   } finally { shutdown(proxy, upstream); }
 });
 
-test('a repeated 4xx is an answer about the request, not starvation', async () => {
-  const { row } = await run(json(400, { type: 'error', error: { type: 'invalid_request_error' } }), 6);
-  assert.equal(row.starved, 0);
+test('a repeated 4xx is an answer about the request, and clears a streak', async () => {
+  let bad = true;
+  const upstream = http.createServer((req, res) => (bad ? json(500, { error: 'boom' })
+    : json(400, { type: 'error', error: { type: 'invalid_request_error' } }))(req, res));
+  const upstreamPort = await listen(upstream);
+  const am = fleet();
+  const proxy = createProxyServer(am, { proxy: {}, upstream: `http://127.0.0.1:${upstreamPort}` });
+  const port = await listen(proxy);
+  try {
+    await prime(port);
+    assert.equal(item(am).starved, 2, 'primed');
+    bad = false;
+    for (let i = 0; i < 6; i++) await post(port);
+    assert.equal(item(am).starved, 0, 'a 400 tells the client something true about what it sent');
+  } finally { shutdown(proxy, upstream); }
 });
 
-test('a 200 carrying no usage object — a third-party upstream — does not starve', async () => {
-  const { row } = await run(json(200, { ok: true }), 6);
-  assert.equal(row.starved, 0, 'answered');
-  assert.equal(Object.keys(row.tokens).length, 0, 'reported nothing: the two are different questions');
+test('a 401 is not an answer: it is about a credential the client never sees', async () => {
+  // A fleet whose keys have all been rotated out answers 401 to everything,
+  // forever — the canonical starving session, and one the client cannot act on.
+  const { row } = await run(json(401, { type: 'error', error: { type: 'authentication_error' } }), 3);
+  assert.equal(row.starved, 3);
 });
 
-// ── the failing shapes ──────────────────────────────────────
+test('a 200 carrying no usage object — a third-party upstream — answers and clears', async () => {
+  let bad = true;
+  const upstream = http.createServer((req, res) => (bad ? json(500, { error: 'boom' }) : json(200, { ok: true }))(req, res));
+  const upstreamPort = await listen(upstream);
+  const am = fleet();
+  const proxy = createProxyServer(am, { proxy: {}, upstream: `http://127.0.0.1:${upstreamPort}` });
+  const port = await listen(proxy);
+  try {
+    await prime(port);
+    bad = false;
+    for (let i = 0; i < 6; i++) await post(port);
+    const row = item(am);
+    assert.equal(row.starved, 0, 'answered');
+    assert.equal(Object.keys(row.tokens).length, 0, 'while reporting no usage: different questions');
+  } finally { shutdown(proxy, upstream); }
+});
 
 test('a stream that dies after message_start starves, though it reported usage', async () => {
   const { row } = await run((req, res) => {
@@ -144,19 +193,28 @@ test('a fleet with nothing available starves a session that never reaches an acc
 // ── the third state ─────────────────────────────────────────
 
 test('a client that walks away mid-stream is not counted as starved', async () => {
+  // The upstream keeps emitting, so streamResponse's next read resolves and the
+  // departure is observed promptly. (A silent upstream is not seen until the
+  // body-idle timeout — see the known limit in the PR.)
   const open = [];
   const upstream = http.createServer((req, res) => {
     open.push(res);
     res.writeHead(200, { 'content-type': 'text/event-stream' });
     res.write('event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":10}}}\n\n');
-    // Deliberately never ended: the client aborts below. Held so teardown can
-    // destroy it — an unended response keeps close() waiting forever.
+    const t = setInterval(() => { try { res.write(': ping\n\n'); } catch { clearInterval(t); } }, 20);
+    res.on('close', () => clearInterval(t));
   });
   const upstreamPort = await listen(upstream);
   const am = fleet();
   const proxy = createProxyServer(am, { proxy: {}, upstream: `http://127.0.0.1:${upstreamPort}` });
   const port = await listen(proxy);
   try {
+    // Primed, so asserting 0 later proves the departure RESET nothing and
+    // ADDED nothing — rather than merely matching the initial value.
+    am.beginSession(SID); am.endSession(SID, false);
+    am.beginSession(SID); am.endSession(SID, false);
+    assert.equal(item(am).starved, 2, 'primed');
+
     for (let i = 0; i < 3; i++) {
       const ac = new AbortController();
       const p = fetch(`http://127.0.0.1:${port}/v1/messages`, {
@@ -164,18 +222,17 @@ test('a client that walks away mid-stream is not counted as starved', async () =
         headers: { 'content-type': 'application/json', 'x-claude-code-session-id': SID },
         body: JSON.stringify({ model: 'claude-opus-5', messages: [] }),
       }).catch(() => {});
-      await new Promise(r => setTimeout(r, 60));
+      await new Promise(r => setTimeout(r, 80));
       ac.abort();
       await p;
+      await new Promise(r => setTimeout(r, 120));
     }
-    await new Promise(r => setTimeout(r, 120));
-    assert.equal(item(am).starved, 0, 'leaving is not the same as getting nothing');
+    assert.equal(item(am).starved, 2, 'leaving is neither an answer nor starvation');
   } finally {
     for (const res of open) res.destroy();
     shutdown(proxy, upstream);
   }
 });
-
 test('the fleet-level maximum is reported, and clears when the session goes quiet', () => {
   let t = 1_000_000;
   const st = new SessionTracker({ now: () => t });
