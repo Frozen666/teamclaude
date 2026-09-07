@@ -6,7 +6,7 @@ import { createProxyServer } from '../src/server.js';
 import {
   renderDashboardHtml, scopedWeeklyRows, accountTokens,
   sessionRows, filterSessionRows, sortRows, uniqSorted,
-  switchRequest, switchOutcome, routeRows,
+  switchRequest, switchOutcome, routeRows, problems, STARVED_MIN,
 } from '../src/dashboard.js';
 
 function listen(server) {
@@ -256,11 +256,91 @@ test('a fleet with no routes renders no section', () => {
   assert.deepEqual(routeRows(null), []);
 });
 
+// Built from a REAL getStatus() rather than a hand-written object: a previous
+// version of this banner was validated against a payload the server can never
+// emit, and the impossible fixture hid a false positive.
+function fleetStatus(mutate) {
+  const am = new AccountManager([
+    { name: 'a', type: 'api_key', apiKey: 'sk-a' },
+    { name: 'b', type: 'api_key', apiKey: 'sk-b' },
+  ], 0.98);
+  mutate?.(am);
+  return am.getStatus({ sessionDetail: true });
+}
+/** Drive a session to `n` consecutive no-answer outcomes on a real tracker. */
+function starve(am, id, n, client = 'alice') {
+  for (let i = 0; i < n; i++) {
+    am.beginSession(id, { client, dimensions: {} });
+    am.endSession(id, false);
+  }
+}
+
+test('a starving session is named, and a working one is not', () => {
+  const named = problems(fleetStatus(am => starve(am, 'deadbeef1234', STARVED_MIN)));
+  assert.equal(named.length, 1);
+  assert.equal(named[0].kind, 'starved-session');
+  assert.equal(named[0].severity, 'bad');
+  assert.match(named[0].text, /alice's session deadbeef/);
+  assert.match(named[0].text, new RegExp(`${STARVED_MIN} requests in a row`));
+
+  // One usable answer clears the streak — the session is working again.
+  assert.deepEqual(problems(fleetStatus(am => {
+    starve(am, 'deadbeef1234', STARVED_MIN);
+    am.beginSession('deadbeef1234'); am.endSession('deadbeef1234', true);
+  })), []);
+  // Below the threshold: an upstream wobble is not an alarm.
+  assert.deepEqual(problems(fleetStatus(am => starve(am, 'deadbeef1234', STARVED_MIN - 1))), []);
+  // A brand-new session, and a fleet doing nothing.
+  assert.deepEqual(problems(fleetStatus(am => am.beginSession('fresh1234', { client: 'bob' }))), []);
+  assert.deepEqual(problems(fleetStatus()), []);
+});
+
+test('without sessionDetail the banner still fires, unnamed', () => {
+  const am = new AccountManager([{ name: 'a', type: 'api_key', apiKey: 'sk-a' }], 0.98);
+  starve(am, 'deadbeef1234', STARVED_MIN);
+  const hidden = am.getStatus();               // sessionDetail off — no items[]
+  assert.equal('items' in hidden.sessions, false);
+  const out = problems(hidden);
+  assert.equal(out.length, 1);
+  assert.equal(out[0].kind, 'starved-session');
+  assert.match(out[0].text, /proxy.sessionDetail/);
+  // And it is not doubled when both the row and the aggregate are available.
+  assert.equal(problems(am.getStatus({ sessionDetail: true })).length, 1);
+});
+
+test('only the account states that need a person are reported', () => {
+  // These clear themselves — rotation and back-off working.
+  for (const quiet of [
+    am => am.markRateLimited(0, 60),
+    am => { am.accounts[0].status = 'exhausted'; },
+    am => { am.accounts[0].quota.unifiedStatus = 'rejected'; am.accounts[0].quota.unifiedStatusSeenAt = Date.now(); },
+  ]) assert.deepEqual(problems(fleetStatus(quiet)), [], 'self-clearing state must stay silent');
+
+  // These do not.
+  const broken = problems(fleetStatus(am => { am.accounts[0].status = 'error'; }));
+  assert.deepEqual(broken.map(p => p.kind), ['account']);
+  assert.match(broken[0].text, /re-login/);
+  const off = problems(fleetStatus(am => am.setDisabled(0, true)));
+  assert.deepEqual(off.map(p => p.kind), ['account']);
+  assert.match(off[0].text, /disabled/);
+});
+
+test('real money is reported; the ability to bill is not', () => {
+  const billing = problems(fleetStatus(am => { am.accounts[0].quota.spend = { enabled: true, usedMinor: 250 }; }));
+  assert.deepEqual(billing.map(p => p.kind), ['spend']);
+  assert.deepEqual(problems(fleetStatus(am => { am.accounts[0].quota.spend = { enabled: true, usedMinor: 0 }; })), []);
+});
+
+test('the page ships the threshold its helper closes over', () => {
+  // The helper alone would parse and then ReferenceError at first render.
+  assert.match(renderDashboardHtml(), new RegExp(`var STARVED_MIN = ${STARVED_MIN}\\b`));
+});
+
 test('the page ships the same helper implementations it is tested against', () => {
   // The serialization is the contract: if a helper stops being self-contained
   // (closes over module scope), the page would silently ReferenceError.
   const html = renderDashboardHtml();
-  for (const fn of [scopedWeeklyRows, accountTokens, sessionRows, filterSessionRows, sortRows, uniqSorted, switchRequest, switchOutcome, routeRows]) {
+  for (const fn of [scopedWeeklyRows, accountTokens, sessionRows, filterSessionRows, sortRows, uniqSorted, switchRequest, switchOutcome, routeRows, problems]) {
     assert.ok(html.includes(fn.toString()), `${fn.name} not serialized into the page`);
   }
   const script = html.slice(html.indexOf('<script>') + 8, html.indexOf('</script>'));

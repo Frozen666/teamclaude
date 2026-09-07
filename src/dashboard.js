@@ -69,6 +69,7 @@ export function sessionRows(sessions) {
       project: (s.dimensions || {}).project || '',
       active: !!s.active,
       requests: s.requests || 0,
+      starved: s.starved || 0,
       cacheRead: 0, cacheCreation: 0, input: 0, output: 0, context: 0,
       accounts: Object.keys(s.pins || {}).map(function (b) { return s.pins[b]; }).join(', '),
       lastSeen: s.lastSeen || 0,
@@ -189,10 +190,76 @@ export function routeRows(status) {
   return rows;
 }
 
+// Consecutive client requests that ended with nothing usable. Claude Code has
+// its own retry loop, so two or three in a row are ordinary during a seconds-long
+// upstream wobble; five with no success in between is past any blip and past the
+// client's own budget. No age floor is needed — unlike a token-based guess, a
+// streak of five is true of no healthy session at any age, so a floor would only
+// delay a true positive.
+export var STARVED_MIN = 5;
+
+/**
+ * What is wrong right now, worst first, or an empty list. Only states that are
+ * actionable and not ordinary operation: a spent weekly bucket, a rate-limit
+ * back-off and an upstream refusal are rotation and back-off working, and
+ * saying so every day would teach the reader to ignore the banner on the day it
+ * matters.
+ */
+export function problems(status) {
+  var s = status || {};
+  var out = [];
+
+  // Named when proxy.sessionDetail is on; otherwise the aggregate still says
+  // that something is starving, which is the half that must not be opt-in.
+  var sessions = s.sessions || {};
+  var named = (sessions.items ? sessionRows(sessions) : []).filter(function (r) {
+    return r.active && r.starved >= STARVED_MIN;
+  });
+  named.forEach(function (r) {
+    out.push({
+      severity: 'bad', kind: 'starved-session',
+      text: (r.client ? r.client + "'s session " : 'Session ') + String(r.id || '').slice(0, 8)
+        + ' has had ' + r.starved + ' requests in a row come back with nothing'
+        + (r.project ? ' (' + r.project + ')' : '') + ' — it is failing, not idle.',
+    });
+  });
+  if (!named.length && (sessions.starvedMax || 0) >= STARVED_MIN) {
+    out.push({
+      severity: 'bad', kind: 'starved-session',
+      text: 'A session has had ' + sessions.starvedMax + ' requests in a row come back with nothing.'
+        + ' Turn on proxy.sessionDetail to see which.',
+    });
+  }
+
+  // Only the two states that do not clear themselves. `entitlement` is a
+  // five-minute cooldown and `upstream-rejected` is upstream's way of saying a
+  // shared bucket is spent — both expire on their own, like `quota` and
+  // `throttled`, and none of them wants a person.
+  var ATTENTION = { error: 'needs a re-login', disabled: 'is disabled' };
+  (s.accounts || []).forEach(function (a) {
+    var why = ATTENTION[a.unavailable];
+    if (why) out.push({ severity: 'warn', kind: 'account', text: 'Account ' + a.name + ' ' + why + '.' });
+  });
+
+  // Past the plan allowance is real money, which no quota bar says.
+  (s.accounts || []).forEach(function (a) {
+    var spend = (a.quota || {}).spend;
+    if (spend && spend.enabled && (spend.usedMinor || 0) > 0) {
+      out.push({ severity: 'warn', kind: 'spend', text: 'Account ' + a.name + ' is billing real money this month.' });
+    }
+  });
+
+  return out;
+}
+
 const SHARED_HELPERS = [
   scopedWeeklyRows, accountTokens, sessionRows, filterSessionRows, sortRows, uniqSorted,
-  switchRequest, switchOutcome, routeRows,
+  switchRequest, switchOutcome, routeRows, problems,
 ].map(fn => fn.toString()).join('\n\n');
+
+// The threshold rides along: `problems` closes over it, so a page without it
+// would ReferenceError on first render.
+const SHARED_CONSTS = `var STARVED_MIN = ${STARVED_MIN};`;
 
 const PAGE = `<!doctype html>
 <html lang="en">
@@ -255,6 +322,10 @@ const PAGE = `<!doctype html>
   .warnt { color: var(--warn); font-size: 12px; }
   .badt { color: var(--bad); }
   #err { color: var(--bad); margin: 12px 0; display: none; }
+  #problems { display: none; margin: 0 0 16px; }
+  #problems div { border-radius: 8px; padding: 8px 12px; margin-bottom: 6px; font-size: 13px; }
+  #problems .bad { background: rgba(248,81,73,.12); border: 1px solid var(--bad); color: var(--bad); }
+  #problems .warn { background: rgba(210,153,34,.12); border: 1px solid var(--warn); color: var(--warn); }
   #keybox { display: none; margin: 40px auto; max-width: 420px; text-align: center; }
   #keybox input { width: 100%; padding: 10px 12px; margin: 12px 0; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; color: var(--text); font: inherit; }
   #keybox button { padding: 8px 20px; background: var(--accent); border: 0; border-radius: 6px; color: #06121f; font: inherit; font-weight: 600; cursor: pointer; }
@@ -273,6 +344,7 @@ const PAGE = `<!doctype html>
     <h1>TeamClaude</h1>
     <p class="sub" id="summary"></p>
     <div id="err"></div>
+    <div id="problems"></div>
     <div id="note"></div>
     <div id="routesWrap" style="display:none">
       <h2>Routing</h2>
@@ -309,6 +381,8 @@ const PAGE = `<!doctype html>
   var sessionFilters = { project: '', client: '' };
   var sortState = { sessions: { key: 'lastSeen', dir: 'desc' } };
   var UNAVAILABLE_TEXT = ${JSON.stringify(UNAVAILABLE_TEXT)};
+
+${SHARED_CONSTS}
 
 ${SHARED_HELPERS}
 
@@ -611,6 +685,17 @@ ${SHARED_HELPERS}
     });
   }
 
+  // Top of the page and only when something is wrong: a banner that is always
+  // on is a banner nobody reads.
+  function renderProblems(s) {
+    var wrap = document.getElementById('problems');
+    var list = problems(s);
+    wrap.textContent = '';
+    if (!list.length) { wrap.style.display = 'none'; return; }
+    wrap.style.display = 'block';
+    list.forEach(function (p) { wrap.appendChild(el('div', p.severity, p.text)); });
+  }
+
   function render(s) {
     lastStatus = s;
     var sess = s.sessions || {};
@@ -623,6 +708,7 @@ ${SHARED_HELPERS}
     var acc = document.getElementById('accounts');
     acc.textContent = '';
     (s.accounts || []).forEach(function (a) { acc.appendChild(renderAccount(a, s.currentAccount)); });
+    renderProblems(s);
     renderRoutes(s);
     renderClients(s.clients);
     renderDimensions(s.usageDimensions);
