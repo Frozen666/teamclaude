@@ -19,6 +19,13 @@ import { SessionTracker } from '../src/session-tracker.js';
 
 const SID = 'sess-starved';
 const listen = (s) => new Promise(r => s.listen(0, '127.0.0.1', () => r(s.address().port)));
+// A stub that deliberately never ends its response leaves a live connection,
+// and `close()` waits for it — which hangs the file on Node 20/22 where the
+// runtime does not tear it down for us. Close the sockets explicitly rather
+// than relying on version-specific behaviour.
+function shutdown(...servers) {
+  for (const srv of servers) { srv.closeAllConnections?.(); srv.close(); }
+}
 const fleet = (n = 1) => new AccountManager(
   Array.from({ length: n }, (_, i) => ({ name: `a${i}`, type: 'api_key', apiKey: `sk-${i}` })), 0.98);
 
@@ -50,7 +57,7 @@ async function run(handler, n, { accounts = 1, before } = {}) {
     before?.(am);
     for (let i = 0; i < n; i++) await post(port);
     return { row: item(am), am };
-  } finally { proxy.close(); upstream.close(); }
+  } finally { shutdown(proxy, upstream); }
 }
 
 const json = (status, body) => (req, res) => {
@@ -89,7 +96,7 @@ test('count_tokens answers correctly while reporting no usage, and does not star
     const row = item(am);
     assert.equal(row.starved, 0, 'six good answers are not starvation');
     assert.equal(Object.keys(row.tokens).length, 0, 'and they report no usage — the old false positive');
-  } finally { proxy.close(); upstream.close(); }
+  } finally { shutdown(proxy, upstream); }
 });
 
 test('a repeated 4xx is an answer about the request, not starvation', async () => {
@@ -137,10 +144,13 @@ test('a fleet with nothing available starves a session that never reaches an acc
 // ── the third state ─────────────────────────────────────────
 
 test('a client that walks away mid-stream is not counted as starved', async () => {
+  const open = [];
   const upstream = http.createServer((req, res) => {
+    open.push(res);
     res.writeHead(200, { 'content-type': 'text/event-stream' });
     res.write('event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":10}}}\n\n');
-    // Keep it open; the client aborts below.
+    // Deliberately never ended: the client aborts below. Held so teardown can
+    // destroy it — an unended response keeps close() waiting forever.
   });
   const upstreamPort = await listen(upstream);
   const am = fleet();
@@ -160,7 +170,10 @@ test('a client that walks away mid-stream is not counted as starved', async () =
     }
     await new Promise(r => setTimeout(r, 120));
     assert.equal(item(am).starved, 0, 'leaving is not the same as getting nothing');
-  } finally { proxy.close(); upstream.close(); }
+  } finally {
+    for (const res of open) res.destroy();
+    shutdown(proxy, upstream);
+  }
 });
 
 test('the fleet-level maximum is reported, and clears when the session goes quiet', () => {
