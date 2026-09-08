@@ -911,6 +911,15 @@ export class AccountManager {
     this.sessionTracker.endRequest(sessionId);
   }
 
+  /**
+   * Record a client request's outcome WITHOUT closing an in-flight hold — for
+   * the exits that answer or refuse before beginSession ever opened one.
+   */
+  recordOutcome(sessionId, usable) {
+    if (!sessionId || usable === null) return;
+    this.sessionTracker.recordOutcome(sessionId, usable);
+  }
+
   /** { known, active, perAccount } session counts for status/TUI. */
   sessionStats() {
     return { ...this.sessionTracker.stats(), draining: this.drainingCount() };

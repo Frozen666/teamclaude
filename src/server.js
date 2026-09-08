@@ -771,11 +771,6 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
           res.end(JSON.stringify({ type: 'error', error: { type: 'proxy_error', message: 'Internal proxy error' } }));
         }
       } finally {
-        // true = the client got an answer it can act on; false = it got nothing;
-        // null = it walked away, which is neither and must not count against the
-        // session. Abandonment is observed where it happens, never inferred here:
-        // the proxy destroys the socket itself on a dead stream, so a clientGone
-        // check at this point would reclassify the worst failure as "the user left".
         // null = record nothing: the client walked away (neither an answer nor a
         // starvation), or this was not a completion at all. Abandonment is
         // observed where it happens, never inferred here: the proxy destroys the
@@ -856,6 +851,40 @@ function reportFailure(...args) {
   }
 }
 
+// A status the client can act on: upstream said something about THIS request.
+// A 4xx IS an answer — it tells the client something true about what it sent,
+// and a session getting legitimate 400s is working, not starving. A 429 is a
+// refusal to answer and a 5xx is a failure to.
+function answeredStatus(status) {
+  // 401 is excluded on purpose. It is about the credential the PROXY injected,
+  // which the client never sees and cannot act on — a fleet whose keys have all
+  // been rotated out answers 401 to everything, forever, and that is the
+  // canonical starving session rather than an answered one.
+  return status < 500 && status !== 429 && status !== 401;
+}
+
+// Only a completion is something a session can starve for. Claude Code sends
+// `count_tokens` under the SAME session id as the completions it is sizing up,
+// and that endpoint keeps working when completions do not — so counting it
+// would let a healthy trickle reset the streak of a session that is getting
+// nothing. Measured before this guard: ten failed completions interleaved with
+// their count_tokens calls reported a streak of one.
+function isCompletionPath(url) {
+  const path = String(url || '').split('?')[0];
+  return path.endsWith('/v1/messages') || path.endsWith('/responses');
+}
+
+// Outcomes for the exits that return BEFORE beginSession. They never open an
+// in-flight hold, so they cannot use the ctx flags, and must not go through
+// endSession either: its endRequest would release a hold this request never
+// took — another request's, if the session has one in flight. But a session
+// that is answered promptly (a blocked model, an unknown pin) must still clear
+// a stale streak, and one the proxy refuses to send at all (egress unpinned)
+// must still count as getting nothing.
+function recordEarlyOutcome(accountManager, sessionId, url, usable) {
+  if (sessionId && isCompletionPath(url)) accountManager.recordOutcome(sessionId, usable);
+}
+
 /**
  * Has the client gone away?
  *
@@ -878,38 +907,6 @@ function reportFailure(...args) {
  * `drain` or a `close` that has already happened and will not happen again, so
  * the handler never returns and its activity entry never closes.
  */
-// A status the client can act on: upstream said something about THIS request.
-// A 4xx IS an answer — it tells the client something true about what it sent,
-// and a session getting legitimate 400s is working, not starving. A 429 is a
-// refusal to answer and a 5xx is a failure to.
-function answeredStatus(status) {
-  // 401 is excluded on purpose. It is about the credential the PROXY injected,
-  // which the client never sees and cannot act on — a fleet whose keys have all
-  // been rotated out answers 401 to everything, forever, and that is the
-  // canonical starving session rather than an answered one.
-  return status < 500 && status !== 429 && status !== 401;
-}
-
-// Only a completion is something a session can starve for. Claude Code sends
-// `count_tokens` under the SAME session id as the completions it is sizing up,
-// and that endpoint keeps working when completions do not — so counting it
-// would let a healthy trickle reset the streak of a session that is getting
-// nothing. Measured before this guard: ten failed completions interleaved with
-// their count_tokens calls reported a streak of one.
-// Outcomes for the exits that return BEFORE beginSession. They never open an
-// in-flight hold, so they cannot use the ctx flags — but a session that is
-// answered promptly (a blocked model, an unknown pin) must still clear a stale
-// streak, and one the proxy refuses to send at all (egress unpinned) must still
-// count as getting nothing.
-function recordEarlyOutcome(accountManager, sessionId, url, usable) {
-  if (sessionId && isCompletionPath(url)) accountManager.endSession(sessionId, usable);
-}
-
-function isCompletionPath(url) {
-  const path = String(url || '').split('?')[0];
-  return path.endsWith('/v1/messages') || path.endsWith('/responses');
-}
-
 function clientGone(res) {
   return !!res.destroyed || !!res.stream?.destroyed;
 }
