@@ -245,3 +245,20 @@ test('the fleet-level maximum is reported, and clears when the session goes quie
   t += 5 * 60 * 1000; // past the active window
   assert.equal(st.stats().starvedMax, 0, 'a session that stopped trying is not still starving');
 });
+
+// An exit before beginSession (blocked model, unknown pin, egress unpinned)
+// records its outcome without an in-flight hold to close. Routing it through
+// endSession would release a hold it never took — another request's, when the
+// session has one in flight — and the pin-ageing branch would fire under it.
+test('an early outcome leaves a concurrent in-flight hold in place', () => {
+  const am = fleet();
+  am.beginSession(SID, 'claude-opus-5');
+  am.recordOutcome(SID, false);
+  assert.equal(am.sessionTracker.sessions.get(SID).inFlight, 1, 'the open request keeps its hold');
+  assert.equal(am.sessionTracker.sessions.get(SID).starved, 1, 'the outcome is still recorded');
+  am.recordOutcome(SID, null);
+  assert.equal(am.sessionTracker.sessions.get(SID).starved, 1, 'null records nothing');
+  am.endSession(SID, true);
+  assert.equal(am.sessionTracker.sessions.get(SID).inFlight, 0);
+  assert.equal(am.sessionTracker.sessions.get(SID).starved, 0);
+});
