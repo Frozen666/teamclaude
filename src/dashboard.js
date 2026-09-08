@@ -220,8 +220,11 @@ export function problems(status) {
   // operator hunting for a broken token. Say which, if the fleet agrees on why.
   var accounts = s.accounts || [];
   var stalled = accounts.filter(function (a) { return a.unavailable === 'quota' || a.unavailable === 'throttled'; });
+  var reasons = {};
+  stalled.forEach(function (a) { reasons[a.unavailable] = true; });
   var why = accounts.length && stalled.length === accounts.length
-    ? ' — every account is ' + (stalled[0].unavailable === 'quota' ? 'over its quota threshold' : 'in a rate-limit hold') + '.'
+    ? ' — every account is ' + (reasons.quota && reasons.throttled ? 'over its quota threshold or in a rate-limit hold'
+      : reasons.quota ? 'over its quota threshold' : 'in a rate-limit hold') + '.'
     : ' — it is failing, not idle.';
 
   var sessions = s.sessions || {};
