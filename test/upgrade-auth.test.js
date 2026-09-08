@@ -28,6 +28,27 @@ test('the upgrade gate answers like the other two', () => {
   assert.deepEqual(resolveUpgradeAuth({ headers: {} }, remote, {}), { ok: true, client: null });
 });
 
+test('the loopback exemption is refused to a web page: foreign Origin or Host', () => {
+  // A page can open a WebSocket to 127.0.0.1 with no CORS check, and the
+  // handshake arrives loopback-sourced. Browsers always send Origin on a
+  // handshake and CLIs never do; a DNS-rebound page also leaves Host naming
+  // the attacker. Same two checks the request path applies to key-less
+  // loopback callers.
+  const local = sock('127.0.0.1');
+  const refused = { ok: false, client: null };
+  const exempt = { ok: true, client: null };
+  assert.deepEqual(resolveUpgradeAuth({ headers: { host: '127.0.0.1:3456', origin: 'https://attacker.example' } }, local, PROXY), refused);
+  assert.deepEqual(resolveUpgradeAuth({ headers: { host: 'attacker.example:3456' } }, local, PROXY), refused);
+  assert.deepEqual(resolveUpgradeAuth({ headers: { host: '127.0.0.1:3456', origin: 'http://localhost:3456' } }, local, PROXY), exempt);
+  assert.deepEqual(resolveUpgradeAuth({ headers: { host: 'localhost:3456' } }, local, PROXY), exempt);
+  assert.deepEqual(resolveUpgradeAuth({ headers: { host: '[::1]:3456', origin: 'http://[::1]:3456' } }, local, PROXY), exempt);
+  // A malformed Origin cannot be trusted either way; refuse.
+  assert.deepEqual(resolveUpgradeAuth({ headers: { host: '127.0.0.1:3456', origin: 'not a url' } }, local, PROXY), refused);
+  // A valid key passes regardless of Origin or Host, and a bound LAN host is local.
+  assert.deepEqual(resolveUpgradeAuth({ headers: { host: 'attacker.example', origin: 'https://attacker.example', 'x-api-key': 'alice-key' } }, local, PROXY), { ok: true, client: 'alice' });
+  assert.deepEqual(resolveUpgradeAuth({ headers: { host: '192.168.1.5:3456' } }, local, { ...PROXY, host: '192.168.1.5' }), exempt);
+});
+
 test('a key offered in Sec-WebSocket-Protocol is NOT accepted', () => {
   // Reading the key out of the subprotocol list would let a browser
   // authenticate — and would leak the operator's key to the upstream, because

@@ -1230,10 +1230,24 @@ function relayStream(req, res, upstream, sx) {
  */
 export function resolveUpgradeAuth(req, socket, proxyConfig) {
   const auth = resolveClientAuth(proxyConfig, req?.headers?.['x-api-key']);
+  if (auth.ok) return auth;
   // Loopback is exempt from the key requirement, exactly as the HTTP and
-  // CONNECT gates are.
-  if (!auth.ok && isLoopbackAddr(socket?.remoteAddress)) return { ok: true, client: null };
-  return auth;
+  // CONNECT gates are — with the request path's two conditions on top, for
+  // the same actor: a web page in the operator's browser. A page can open a
+  // WebSocket to 127.0.0.1 with no CORS check at all, and its handshake is
+  // loopback-sourced too. What it cannot forge is `Origin`, which a browser
+  // sets on every handshake and a CLI never sends, nor `Host`, which a
+  // rebound name (attacker.example → 127.0.0.1) leaves naming the attacker.
+  if (!isLoopbackAddr(socket?.remoteAddress)) return auth;
+  const bindHost = proxyConfig?.host;
+  const origin = req?.headers?.origin;
+  if (origin) {
+    let originHost;
+    try { originHost = new URL(origin).host; } catch { return auth; }
+    if (!isLocalHostHeader(originHost, bindHost)) return auth;
+  }
+  if (!isLocalHostHeader(req?.headers?.host, bindHost)) return auth;
+  return { ok: true, client: null };
 }
 
 /**
