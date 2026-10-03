@@ -419,6 +419,26 @@ A [NanoGPT](https://docs.nano-gpt.com/integrations/claude-code) account is the s
 
 Which models a NanoGPT subscription covers, and which are billed from the balance on top, is set by NanoGPT and not published per model; its `Plan` line in `teamclaude status` (see [third-party backend quota](quota.md#third-party-backend-quota)) shows when a request has started to bill the balance.
 
+A [Z.ai GLM Coding Plan](https://docs.z.ai/devpack/tool/claude) is the same shape. Its endpoint serves only its own model names, so map the Claude names your sessions send onto them, and it takes the key as a bearer exactly as Claude Code's `ANTHROPIC_AUTH_TOKEN` would send it:
+
+```json
+{
+  "name": "z.ai",
+  "type": "oauth",
+  "accessToken": "your-z.ai-api-key",
+  "upstream": "https://api.z.ai/api/anthropic",
+  "priority": 100,
+  "modelMap": {
+    "claude-haiku-4-5-20251001": "glm-5.3-flash",
+    "claude-sonnet-5": "glm-5.3",
+    "claude-opus-5": "glm-5.3",
+    "claude-fable-5-1": "glm-5.3"
+  }
+}
+```
+
+Its 5-hour and weekly windows show up in `teamclaude status` (see [third-party backend quota](quota.md#third-party-backend-quota)). `priority: 100` makes it a fallback once the Claude accounts are spent — and then the `modelMap` above rewrites the Claude names onto GLM. A [route](routing.md#model-routes) matching `glm-*` sends a session to it on purpose, but a route only restricts who serves the models it matches; it does not keep the account out of ordinary rotation for the rest, so keep the priority high either way.
+
 Reserve the backend for sessions that explicitly ask for its models with a [route](routing.md#model-routes):
 
 ```json
