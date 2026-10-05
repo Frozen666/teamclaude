@@ -48,6 +48,43 @@ Running the probe sidesteps this entirely — it refreshes the family buckets fr
 
 A probe revalidates a family bucket in full, which includes concluding that there is no cap. When the payload enumerates an account's scoped weekly caps and a family is **not** among them, the cached reading is cleared and that family falls back to the shared weekly bucket — upstream retiring a cap must not leave the proxy gating on it. A payload that carries no such enumeration proves nothing, so nothing changes. Each reported bucket also carries its own reset, taken verbatim: an unstarted window has no reset, and the bar shows no date rather than the shared weekly one.
 
+## Spend from outside the proxy
+
+An account in the pool can also be used somewhere else — a local login, a credentials file on another machine — and that spend lands on the same weekly limit while none of the proxy's counters see it. `quota.outsideSpend` in `/teamclaude/status` reports how much of each weekly window was spent elsewhere, as a share of that week:
+
+```json
+"outsideSpend": {
+  "unified7d": { "share": 0.04, "state": "measured", "since": "2026-10-05T08:00:00.000Z" },
+  "unified7dFable": { "share": null, "state": "not_measurable", "since": "2026-10-05T08:00:00.000Z" }
+}
+```
+
+`teamclaude status` and the dashboard show the same thing in one line: `4.0% of the week went elsewhere · Fable week: not measurable`.
+
+How it is attributed. Between two fresh readings of one window on one account:
+
+| the utilization rose and | attribution |
+|---|---|
+| the proxy served nothing on that account | **outside** — the whole rise |
+| the proxy served at least one request | unattributable — not counted |
+
+A request counts as served from the moment it is dispatched until its response has fully ended, so a long stream keeps the account busy for its whole length — and for a two-minute settle time after it, because the usage endpoint can trail a response, and a reading taken before our own spend has landed would otherwise show it as a rise across an "idle" interval. Only a rise above the highest reading of the window counts, so a reading that wobbles down and back up is never counted twice. The sum restarts when the window resets.
+
+Two properties to keep in mind when reading it:
+
+- **It is a floor, not an estimate.** Spend elsewhere while this proxy was also serving the account cannot be split out, so it is not counted. Reading more often does not tighten it; only the proxy being idle on the account more often does.
+- **It depends on the probe for idle accounts.** A response only ever reports quota for a request this proxy served, so the idle intervals the figure is built from end in a [quota probe](#quota-probe) reading. With the probe off, an account the proxy is not routing to gets no fresh readings and its outside spend is invisible, not absent.
+
+Each window is in one of three states, and only the first carries a number:
+
+| `state` | meaning |
+|---|---|
+| `measured` | at least one idle interval was observed in this window; `share` is the outside spend over those intervals (`0` is a real answer: idle, and nothing moved) |
+| `not_measurable` | there were fresh readings, but the proxy was serving the account across every interval between them |
+| `not_observed` | fewer than two fresh readings in this window — typically the probe is off and the account was not routed to |
+
+`since` is when tracking of the current window started (the first fresh reading of it). Only weekly windows are tracked — the all-models weekly and any family bucket the account reports. The 5h window rolls over too often for a floor to say anything. The sums persist in `teamclaude.state.json`; the interval spanning a restart is never attributed to the outside, since the proxy cannot know what it served while it was down.
+
 ## Keep-warm
 
 The rolling **5-hour session window** only starts once an account sends a real message. So when your active account runs out and rotation moves to a cold account, that account's 5h window starts *then* — right when you need its full headroom. Keep-warm ([#76](https://github.com/KarpelesLab/teamclaude/issues/76)) starts the timer on idle accounts ahead of time, so the next account is already partway (or fully) through a fresh window when it's needed.

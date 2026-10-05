@@ -16,7 +16,9 @@ test('exportQuotaState carries only persistable fields and identity, no credenti
   // identifies an account that has no Anthropic uuid to be matched by.
   assert.deepEqual(
     Object.keys(entry).sort(),
-    ['accountUuid', 'accountId', 'userId', 'provider', 'name', 'orgName', 'orgUuid', 'profile', 'quota', 'adaptive'].sort(),
+    // `outsideSpend` is learned state like `adaptive` (#475): per-window sums,
+    // never a token or an activity stamp.
+    ['accountUuid', 'accountId', 'userId', 'provider', 'name', 'orgName', 'orgUuid', 'profile', 'quota', 'adaptive', 'outsideSpend'].sort(),
   );
   assert.equal(entry.accountUuid, 'p1');
   assert.equal(entry.provider, 'anthropic');

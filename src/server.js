@@ -3152,6 +3152,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     if (sendBody.length > 0) l.body('REQUEST BODY', sendBody, req.headers['content-type']);
   };
 
+  let activityOpened = false;
   try {
     // Storm control: pace requests onto a freshly-switched account so a failover
     // burst doesn't slam it all at once and cascade (issue #84). The slot is held
@@ -3163,6 +3164,8 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // is paused or ramping, which is exactly when clients give up, so leaving it
     // unmarked clustered false positives where the signal is read hardest.
     if (!await accountManager.admit(account.index, () => clientGone(res))) { ctx.abandoned = true; return; }
+    accountManager.beginActivity(account.index);
+    activityOpened = true;
     // This request may have selected the account before another in-flight request
     // observed an entitlement denial. Re-check after admission, when the queued
     // request is about to send, so the cooldown also drains that preselected
@@ -3857,6 +3860,10 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       ctx.proxyClosed = true;
       res.destroy();
     }
+  } finally {
+    // Outside-spend attribution counts this account as busy from dispatch until
+    // the response has fully ended, streams included (#475).
+    if (activityOpened) accountManager.endActivity(account.index);
   }
 }
 

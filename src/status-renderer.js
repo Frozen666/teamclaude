@@ -78,6 +78,8 @@ export function renderStatus(status, { color = process.stdout.isTTY, now = Date.
     if (spend) lines.push(`  ${spend}`);
     const resetCredits = resetCreditLine(account, paint, now);
     if (resetCredits) lines.push(`  ${resetCredits}`);
+    const outside = outsideSpendText(account.quota?.outsideSpend);
+    if (outside) lines.push(`  ${paint.dim('Outside'.padEnd(8))} ${outside}`);
     lines.push(`  ${paint.dim('Usage'.padEnd(8))} ${formatUsage(account.usage, now)}`);
     lines.push(`  ${paint.dim('Probe'.padEnd(8))} ${formatAccountProbe(nameText(account.name), probe, now, paint)}`);
     const adaptive = adaptiveFor(status, nameText(account.name));
@@ -193,6 +195,49 @@ export function spendLine(account, paint) {
     : spend.disabledReason ? `now off (${safeLine(spend.disabledReason, 64)})`
     : 'now off';
   return `${paint.dim('Spend'.padEnd(8))} ${paint.yellow(`${amount} spent this month, ${why}`)}`;
+}
+
+/**
+ * The outside-spend read-out for one account, or null when it reports no
+ * weekly window (#475). One phrase per window, joined with " · ":
+ *
+ *   "4.0% of the week went elsewhere"          measured (0% is a real answer)
+ *   "Fable week: not measurable"               served at every reading
+ *   "week: not observed (quota probe off?)"    no fresh readings to compare
+ *
+ * Never "0%" for the last two: those are "no answer", not "nothing". The
+ * share is a floor — spend elsewhere while this proxy was also serving the
+ * account is not counted, and docs/quota.md says so.
+ *
+ * Pure and closure-free on purpose: the dashboard serializes it into its page
+ * with toString(), so the terminal and the browser say the same thing.
+ *
+ * @param {Record<string, {share: number|null, state: string, since: string|null}>|null|undefined} outsideSpend
+ * @returns {string|null}
+ */
+export function outsideSpendText(outsideSpend) {
+  var o = outsideSpend || {};
+  var keys = Object.keys(o).sort(function (a, b) {
+    if (a === 'unified7d') return -1;
+    if (b === 'unified7d') return 1;
+    return a < b ? -1 : a > b ? 1 : 0;
+  });
+  if (!keys.length) return null;
+  var parts = keys.map(function (key) {
+    /** @type {{share?: number|null, state?: string}} */
+    var v = o[key] || {};
+    var family = key === 'unified7d' ? ''
+      : key === 'unified7dFable' ? 'fable'
+      : key === 'unified7dSonnet' ? 'sonnet'
+      : key.indexOf('scoped:') === 0 ? key.slice(7) : key;
+    var label = family ? family.charAt(0).toUpperCase() + family.slice(1) + ' week' : 'week';
+    if (v.state === 'measured' && typeof v.share === 'number') {
+      return (Math.round(v.share * 1000) / 10).toFixed(1) + '% of the ' + label + ' went elsewhere';
+    }
+    if (v.state === 'not_measurable') return label + ': not measurable';
+    return label + ': not observed (quota probe off?)';
+  });
+  return parts.join(' \u00b7 ');
 }
 
 /**

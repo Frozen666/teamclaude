@@ -15,7 +15,7 @@
 // operator/OAuth-derived, but they still never reach innerHTML.
 
 import { createHash } from 'node:crypto';
-import { UNAVAILABLE_TEXT, RESET_CREDIT_MAX_AGE_MS } from './status-renderer.js';
+import { UNAVAILABLE_TEXT, RESET_CREDIT_MAX_AGE_MS, outsideSpendText } from './status-renderer.js';
 import { USAGE_WINDOWS } from './client-usage.js';
 
 export function renderDashboardHtml() {
@@ -646,6 +646,7 @@ export function usageFor(entry, view) {
 const SHARED_HELPERS = [
   scopedWeeklyRows, accountTokens, modelLabel, recentModelLabels, providerLabel, thresholdBadgeText, accountBadges, sessionRows, filterSessionRows, sortRows, uniqSorted,
   switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, thresholdRequest, thresholdPercentText, thresholdOutcome, routeRows, problems, usageFor,
+  outsideSpendText,
 ].map(fn => fn.toString()).join('\n\n');
 
 // The constants ride along: `problems` closes over the thresholds and
@@ -991,6 +992,9 @@ ${SHARED_HELPERS}
       card.appendChild(el('div', 'usage', 'quota unknown (no traffic observed yet)'));
     }
     if (models) card.appendChild(models);
+    // Spend on this account that did not come through the proxy (#475).
+    var outside = outsideSpendText(q.outsideSpend);
+    if (outside) card.appendChild(el('div', 'usage', 'outside: ' + outside));
     var u = a.usage || {};
     var last = u.lastUsed ? ' · last ' + fmtAgo(u.lastUsed) : '';
     card.appendChild(el('div', 'usage', (u.totalRequests || 0) + ' req · ' + fmtNum(accountTokens(u)) + ' tok' + last));
