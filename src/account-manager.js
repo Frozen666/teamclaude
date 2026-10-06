@@ -9,6 +9,7 @@ import { buildQuotaSummary, quotaTier } from './quota-summary.js';
 import { ROLLOVER_MIN_JUMP_MS, remapHeld, findHeld, dropHeld, newObservation } from './rollover.js';
 import { decideBand, pressureOf, pressureRank, assertNever } from './band-decision.js';
 import { BurnRateLearner, ConcurrencyLearner, scoreCandidate } from './adaptive-distribution.js';
+import { OutsideSpendTracker, OUTSIDE_SPEND_STATES, OUTSIDE_SPEND_SETTLE_MS, outsideSpendKey } from './outside-spend.js';
 import { safeLine } from './safe-text.js';
 import { parseRoutingUrl, describeRouting, routingToUrl, isRoutingFailure } from './account-routing.js';
 import { isSelfProxy } from './upstream-proxy.js';
@@ -426,6 +427,13 @@ function makeAccount(acct, index, listener = null) {
     // Storm control (see admit/release): in-flight upstream requests and the
     // time this account last became the current one (starts a ramp window).
     inFlight: 0,
+    // Outside-spend attribution (see beginActivity/endActivity): how many
+    // requests have been dispatched to this account, and how many are still
+    // open. Unlike inFlight, a request stays open until its response has fully
+    // ended — a stream spends quota long after its headers arrived.
+    activitySeq: 0,
+    activityOpen: 0,
+    activityEndedAt: 0,
     rampStartedAt: null,
     // Rate-limit pause (see pauseAccount): a short window during which new
     // requests wait in admit() rather than flooding — set from a 429's
@@ -536,6 +544,9 @@ export class AccountManager {
     // estimate. Learners are constructed unconditionally so enabling adaptive
     // mode at runtime can use observations already collected in this process.
     this.burnRateLearner = new BurnRateLearner(adaptive);
+    this.outsideSpend = new OutsideSpendTracker();
+    // Hands out stamps no other reading can equal (see _activityStamp).
+    this._busyStamp = 0;
     this.concurrencyLearner = new ConcurrencyLearner(adaptive);
     // The last adaptiveStats() a status read computed, and when. Time is the
     // only thing that invalidates it (see _adaptiveStatsCached).
@@ -4156,6 +4167,7 @@ export class AccountManager {
     }
 
     this._observeBurnRate(account, observed);
+    this._observeOutsideSpend(account, observed);
 
     account.usage.totalRequests++;
     account.usage.lastUsed = new Date().toISOString();
@@ -4282,6 +4294,7 @@ export class AccountManager {
     if (resetsAt != null) account.quota.resetsAt = resetsAt;
 
     this._observeBurnRate(account, observed);
+    this._observeOutsideSpend(account, observed, { familyResets: false });
 
     account.usage.totalRequests++;
     account.usage.lastUsed = new Date().toISOString();
@@ -4295,6 +4308,110 @@ export class AccountManager {
           : '?';
       console.log(`[TeamClaude] Account "${safeLine(account.name, 64)}" at ${pct}% usage — will switch on next request`);
     }
+  }
+
+  /**
+   * A request was dispatched to this account. Pair every call with
+   * endActivity() once the response has fully ended (or failed): outside-spend
+   * attribution reads "the proxy served nothing between two readings" from
+   * these two counters, so an open stream must keep the account busy.
+   * @param {number} index
+   */
+  beginActivity(index) {
+    const account = this.accounts[index];
+    if (!account) return;
+    account.activitySeq = (account.activitySeq || 0) + 1;
+    account.activityOpen = (account.activityOpen || 0) + 1;
+  }
+
+  /** The request opened by beginActivity() has ended.
+   * @param {number} index */
+  endActivity(index) {
+    const account = this.accounts[index];
+    if (!account) return;
+    if ((account.activityOpen || 0) > 0) account.activityOpen--;
+    account.activityEndedAt = Date.now();
+  }
+
+  /**
+   * The account's activity at the moment of a reading. Two readings with the
+   * same stamp bracket an interval in which nothing was dispatched and nothing
+   * was open. A request open AT a reading gets a stamp no later reading can
+   * equal, so the interval after it can never count as idle — the stream may
+   * still be spending.
+   * @param {Record<string, any>} account
+   */
+  _activityStamp(account, now = Date.now()) {
+    if ((account.activityOpen || 0) > 0) return `busy:${++this._busyStamp}`;
+    // Our own spend can reach the usage endpoint a little after the response
+    // ended. A reading taken inside that settle time may not yet carry it, and
+    // the next reading would then show it as a rise across an "idle" interval.
+    // So the account counts as busy until the settle time has passed.
+    if (now - (account.activityEndedAt || 0) < OUTSIDE_SPEND_SETTLE_MS) return `busy:${++this._busyStamp}`;
+    return `seq:${account.activitySeq || 0}`;
+  }
+
+  /** Feed fresh weekly readings to the outside-spend tracker (#475). Same
+   * buckets and same three call sites as _observeBurnRate.
+   * @param {Record<string, any>|undefined} account
+   * @param {Iterable<string>|undefined} buckets */
+  _observeOutsideSpend(account, buckets, { familyResets = true } = {}) {
+    if (!account) return;
+    const q = account.quota;
+    const now = Date.now();
+    const stamp = this._activityStamp(account, now);
+    /** @type {Set<string>} */
+    const done = new Set();
+    for (const bucket of buckets || []) {
+      let utilization;
+      let resetAt;
+      if (bucket.startsWith('scoped:')) {
+        const scoped = q.scopedWeekly?.[bucket.slice('scoped:'.length)];
+        utilization = scoped?.utilization;
+        resetAt = scoped?.resetAt ?? null;
+      } else {
+        utilization = q[bucket];
+        resetAt = q[`${bucket}Reset`] ?? null;
+      }
+      // One window, one slot: a probe reports Fable both as the dedicated
+      // field and in scopedWeekly, and counting both would show it twice.
+      const key = outsideSpendKey(bucket);
+      if (done.has(key)) continue;
+      done.add(key);
+      // The header path stores the shared weekly reset on a family bucket it
+      // has no reset for, so its family resets are not trusted to date a window.
+      if (!familyResets && key !== 'unified7d') resetAt = null;
+      if (utilization != null) {
+        this.outsideSpend.observe(account.index, key, utilization, resetAt, stamp, now);
+      }
+    }
+  }
+
+  /**
+   * `quota.outsideSpend` for status: `{ [bucket]: { share, state, since } }`.
+   * Every weekly window the account currently reports is present, so a window
+   * with no answer says `not_observed` rather than being missing — a reader
+   * must never have to guess between "absent" and "zero".
+   * @param {Record<string, any>} account
+   * @param {number} [now]
+   */
+  outsideSpendStatus(account, now = Date.now()) {
+    const tracked = this.outsideSpend.viewAll(account.index, now);
+    /** @type {Record<string, any>} */
+    const q = account.quota;
+    const known = [];
+    for (const key of ['unified7d', 'unified7dFable', 'unified7dSonnet']) if (q[key] != null) known.push(key);
+    for (const [family, bucket] of Object.entries(q.scopedWeekly || {})) {
+      if (bucket?.utilization != null) known.push(outsideSpendKey(`scoped:${family}`));
+    }
+    for (const key of known) {
+      if (!tracked[key]) tracked[key] = { share: null, state: OUTSIDE_SPEND_STATES.NOT_OBSERVED, since: null };
+    }
+    // Family names come from upstream; they are rendered into a terminal.
+    /** @type {Record<string, import('./outside-spend.js').OutsideSpendView>} */
+    const out = {};
+    for (const [key, view] of Object.entries(tracked)) out[safeLine(key, 64)] = view;
+    return out;
   }
 
   /**
@@ -4473,6 +4590,7 @@ export class AccountManager {
     // A probe provides fresh utilization points without spending quota itself.
     // Feed only the windows actually present in this payload.
     this._observeBurnRate(account, observed);
+    this._observeOutsideSpend(account, observed);
 
     // Banked usage-limit resets (issue #493), stamped exactly as the Codex
     // path stamps its reset credits: a payload with no usable reset block
@@ -4523,6 +4641,8 @@ export class AccountManager {
       q.unified7d = usage.sevenDay.utilization;
       q.unified7dReset = usage.sevenDay.resetAt ?? null;
       q.unified7dSeenAt = Date.now();
+      // A read-only reading, so it can close an idle interval (#475).
+      if (q.unified7d != null) this._observeOutsideSpend(account, ['unified7d']);
     }
     // Same sticky fact the header path records; see _updateCodexQuota.
     if (usage.fiveHour) q.sessionWindowStated = true;
@@ -4864,6 +4984,7 @@ export class AccountManager {
     const remap = idx => (idx === index ? null : idx > index ? idx - 1 : idx);
     this.sessionTracker.remapAccounts(remap);
     this.burnRateLearner.remapAccounts(remap);
+    this.outsideSpend.remapAccounts(remap);
     this.concurrencyLearner.remapAccounts(remap);
     // The observation names its account by index, so it follows the shift or
     // goes away with the account it described. Left behind, it would be read
@@ -4920,7 +5041,8 @@ export class AccountManager {
       // `accountUuid`: a row saved without them reads as Anthropic and stops
       // matching the account it was written for. Rows from an older version
       // therefore stop restoring Codex quota, which is re-learned from traffic.
-      return { accountUuid: a.accountUuid, accountId: a.accountId, userId: a.userId, provider: providerOf(a), orgUuid: a.orgUuid, orgName: a.orgName, name: a.name, profile, quota, adaptive };
+      const outsideSpend = this.outsideSpend.export(a.index);
+      return { accountUuid: a.accountUuid, accountId: a.accountId, userId: a.userId, provider: providerOf(a), orgUuid: a.orgUuid, orgName: a.orgName, name: a.name, profile, quota, adaptive, outsideSpend };
     });
   }
 
@@ -4941,6 +5063,7 @@ export class AccountManager {
         if (match.profile?.[field] != null) account[field] = match.profile[field];
       }
       this.burnRateLearner.restore(account.index, match.adaptive?.burnRate);
+      this.outsideSpend.restore(account.index, match.outsideSpend);
       this.concurrencyLearner.restore(account.index, match.adaptive?.concCap);
       // We already know this account's weekly window, so it isn't "probing".
       if (account.quota.unified7dReset != null) account.probing = false;
@@ -5050,7 +5173,7 @@ export class AccountManager {
         // Omitted rather than sent empty when the account carries none, so the
         // renderer's "is there a breakdown" test stays a plain truthiness check.
         sessionsByBucket: sessions.perAccountBucket?.[a.index] || null,
-        quota: { ...a.quota },
+        quota: { ...a.quota, outsideSpend: this.outsideSpendStatus(a) },
         // `byBucket` is the one nested value under `usage`, so the shallow copy
         // that covers every flat counter beside it would hand the caller a live
         // reference into the account, leaving the payload half snapshot and half
