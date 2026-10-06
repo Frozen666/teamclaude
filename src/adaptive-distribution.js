@@ -227,6 +227,17 @@ export class BurnRateLearner {
   }
 
   /**
+   * When the learner last took a fresh reading of this window, or null.
+   * @param {number} index
+   * @param {string} bucket
+   * @returns {number|null}
+   */
+  lastReadingAt(index, bucket) {
+    const at = this.state.get(`${index}:${bucket}`)?.lastAt;
+    return Number.isFinite(at) ? at : null;
+  }
+
+  /**
    * How much headroom to hold back from the threshold for this bucket, as a
    * fraction of the window: what the account would spend over `lookaheadMs` at
    * its own observed rate, bounded so neither an idle account nor a runaway one

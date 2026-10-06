@@ -184,3 +184,45 @@ test('teamclaude status prints the Forecast line only when there is a warning', 
 test('the dashboard page carries the same forecastText', () => {
   assert.ok(renderDashboardHtml().includes(forecastText.toString()));
 });
+
+// ── review follow-ups ─────────────────────────────────────────────────────
+
+test('the projection starts when the reading was taken, so an old reading counts down', () => {
+  const base = { utilization: 0.5, threshold: 0.98, ratePerMs: 0.01 / HOUR, resetAt: NOW + 3 * DAY };
+  assert.equal(forecastWindow({ ...base, seenAt: NOW - 10 * HOUR, now: NOW }).reachesThresholdAt, NOW + 38 * HOUR);
+  assert.equal(forecastWindow({ ...base, seenAt: NOW - 50 * HOUR, now: NOW }).reachesThresholdAt, NOW - 2 * HOUR, 'past: the reader shows nothing');
+  assert.equal(forecastWindow({ ...base, seenAt: NOW + HOUR, now: NOW }).reachesThresholdAt, NOW + 48 * HOUR, 'a future stamp is not trusted');
+});
+
+test('status anchors the dedicated weekly at unified7dSeenAt', () => {
+  const am = new AccountManager([oauth('a')], 0.98);
+  learn(am, 'unified7d', 0.01);
+  am.applyUsageData(0, { sevenDay: { utilization: 0.5, resetAt: Date.now() + 3 * DAY } });
+  am.accounts[0].quota.unified7dSeenAt = Date.now() - 10 * HOUR;
+  const f = am.getStatus().accounts[0].quota.forecast.unified7d;
+  const hours = (f.reachesThresholdAt - Date.now()) / HOUR;
+  assert.ok(hours > 37.9 && hours <= 38, `~38h, got ${hours}`);
+});
+
+test('a scoped family is forecast against the shared weekly threshold, the one that gates it', () => {
+  const am = new AccountManager([oauth('a', { switchThreshold: { unified7d: 0.9 } })], { default: 0.98 });
+  const q = am.accounts[0].quota;
+  q.scopedWeekly = { opus: { utilization: 0.5, resetAt: Date.now() + 3 * DAY } };
+  assert.equal(am.getStatus().accounts[0].quota.forecast['scoped:opus'].threshold, 0.9);
+});
+
+test('a scoped family with no stamp of its own is anchored at the learner reading', () => {
+  const am = new AccountManager([oauth('a')], 0.98);
+  const t0 = Date.now() - 10 * HOUR;
+  am.burnRateLearner.observeUtilization(0, 'scoped:opus', 0.40, t0 - 5 * 60_000);
+  am.burnRateLearner.observeUtilization(0, 'scoped:opus', 0.40 + 0.01 / 12, t0);
+  am.accounts[0].quota.scopedWeekly = { opus: { utilization: 0.5, resetAt: Date.now() + 3 * DAY } };
+  const f = am.getStatus().accounts[0].quota.forecast['scoped:opus'];
+  const hours = (f.reachesThresholdAt - Date.now()) / HOUR;
+  assert.ok(hours > 37.9 && hours <= 38.1, `~38h, got ${hours}`);
+});
+
+test('reach and reset that round alike still say the threshold comes first', () => {
+  assert.equal(forecastText({ unified7d: { ratePerHour: 0.01, threshold: 0.98, reachesThresholdAt: NOW + 52 * HOUR, resetAt: NOW + 52 * HOUR + 10 * 60_000 } }, NOW),
+    'week reaches 98% in ~2d4h, just before it resets');
+});

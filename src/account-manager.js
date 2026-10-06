@@ -4442,7 +4442,18 @@ export class AccountManager {
         ratePerMs = this.burnRateLearner.learnedRate(account.index, b);
         if (ratePerMs != null) break;
       }
-      out[safeKey] = forecastWindow({ utilization, threshold: this.thresholdFor(key, account), ratePerMs, resetAt, now });
+      // A scoped family with no dedicated field is gated against the shared
+      // weekly's threshold (_governingWeekly + _isNearQuota): `scoped:*` is
+      // not a threshold key, so asking for it would always read `default`.
+      const thresholdKey = key.startsWith('scoped:') ? 'unified7d' : key;
+      // When the reading was taken: the dedicated fields stamp it, a scoped
+      // bucket does not, and the learner saw it on the same fresh-reading path.
+      let seenAt = q[`${key}SeenAt`] ?? null;
+      for (const b of learnerBuckets) {
+        if (seenAt != null) break;
+        seenAt = this.burnRateLearner.lastReadingAt(account.index, b);
+      }
+      out[safeKey] = forecastWindow({ utilization, threshold: this.thresholdFor(thresholdKey, account), ratePerMs, resetAt, seenAt, now });
     };
     // A probe reports Fable and Sonnet both as the dedicated field and in
     // scopedWeekly; the learner may have learned either, so both are asked.

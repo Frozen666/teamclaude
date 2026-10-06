@@ -97,7 +97,7 @@ The burn-rate learner behind [adaptive distribution](routing.md#adaptive-distrib
 }
 ```
 
-`ratePerHour` is a share of the window per hour (`0.0029` is 0.29% an hour). `reachesThresholdAt` and `resetAt` are ms epoch, like the quota's own `*Reset` fields. `threshold` is the account's own [switch threshold](#switch-threshold) for that window.
+`ratePerHour` is a share of the window per hour (`0.0029` is 0.29% an hour). `reachesThresholdAt` and `resetAt` are ms epoch, like the quota's own `*Reset` fields. `threshold` is the account's own [switch threshold](#switch-threshold) for that window. A family bucket that has no field of its own (`scoped:opus`) is gated against the shared weekly threshold, and is forecast against it too.
 
 `teamclaude status` and the dashboard say something only when it matters: `week reaches 98% in ~31h, resets in 52h`. A window that resets before it reaches the threshold is the good case and gets no sentence.
 
@@ -106,10 +106,10 @@ The burn-rate learner behind [adaptive distribution](routing.md#adaptive-distrib
 | field | `null` when |
 |---|---|
 | `ratePerHour` | the learner has no rate for this window yet; the assumed starting rate (`initialBurnRate`) is never reported as one |
-| `reachesThresholdAt` | no rate, a rate of zero, the account is already at or above its threshold, or the window's reset has passed and the reading is from the old window |
+| `reachesThresholdAt` | no rate, a rate of zero, the account is already at or above its threshold, or the window's reset has passed and the reading is from the old window. It can lie in the past when the reading is old |
 | `resetAt` | the window reports no reset, or it has passed |
 
-What the rate is. It is the learner's moving average of how fast utilization rose, measured over windows of `burnWindowMs` between readings no more than `maxSampleAgeMs` apart (see [`adaptiveDistribution`](configuration.md)). It counts all spend on the account, the proxy's and [outside spend](#spend-from-outside-the-proxy) alike. Like any moving average it reflects the recent past: a burst that has stopped keeps the forecast short until flat readings bring the rate down, and an account with no fresh readings keeps its last rate. With the [quota probe](#quota-probe) off, an idle account gets no readings, so its forecast is as old as its last traffic.
+What the rate is. It is the learner's moving average of how fast utilization rose, measured over windows of `burnWindowMs` between readings no more than `maxSampleAgeMs` apart (see [`adaptiveDistribution`](configuration.md)). It counts all spend on the account, the proxy's and [outside spend](#spend-from-outside-the-proxy) alike. Like any moving average it reflects the recent past: a burst that has stopped keeps the forecast short until flat readings bring the rate down, and an account with no fresh readings keeps its last rate. The projection starts when the utilization was read, not at the status read, so an old reading counts down rather than repeating the same distance; once its projected time has passed, the status text drops it. With the [quota probe](#quota-probe) off, an idle account gets no readings, so its forecast is as old as its last traffic.
 
 ## Keep-warm
 

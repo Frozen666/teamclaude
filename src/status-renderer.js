@@ -292,8 +292,11 @@ export function forecastText(forecast, now) {
       : key.indexOf('scoped:') === 0 ? key.slice(7) : key;
     var label = family ? family.charAt(0).toUpperCase() + family.slice(1) + ' week' : 'week';
     var pct = typeof v.threshold === 'number' ? Math.round(v.threshold * 100) + '%' : 'its threshold';
-    parts.push(label + ' reaches ' + pct + ' in ~' + dur(at - now)
-      + (reset != null ? ', resets in ' + dur(reset - now) : ''));
+    var reach = dur(at - now);
+    var resetText = reset != null ? dur(reset - now) : null;
+    // Rounded separately, the two can print alike; the threshold still comes first.
+    parts.push(label + ' reaches ' + pct + ' in ~' + reach
+      + (resetText == null ? '' : resetText === reach ? ', just before it resets' : ', resets in ' + resetText));
   }
   return parts.length ? parts.join(' \u00b7 ') : null;
 }
