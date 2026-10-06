@@ -283,6 +283,10 @@ function listen(server) {
   return new Promise(resolve => server.listen(0, '127.0.0.1', () => resolve(server.address().port)));
 }
 
+async function until(condition) {
+  while (!condition()) await new Promise(r => setImmediate(r));
+}
+
 test('the proxy holds the account busy from dispatch until the stream ends', async () => {
   let release;
   const gate = new Promise(r => { release = r; });
@@ -308,15 +312,15 @@ test('the proxy holds the account busy from dispatch until the stream ends', asy
       body: JSON.stringify({ model: 'claude-opus-5', messages: [], stream: true }),
     }).then(r => r.text());
     await sent;
-    // Headers are in and admit()'s slot is released, but the stream is open.
-    await new Promise(r => setTimeout(r, 50));
-    assert.equal(am.accounts[0].inFlight, 0, 'admission slot released at headers');
+    // Wait for the state, not for a delay: the proxy releases admit()'s slot
+    // when the headers reach it, and the upstream holds the body open until
+    // release(), so "slot released" can only be seen with the stream open. The
+    // runner's own timeout is the bound (test/README.md).
+    await until(() => am.accounts[0].usage.totalRequests === 1 && am.accounts[0].inFlight === 0);
     assert.equal(am.accounts[0].activityOpen, 1, 'still busy while the body streams');
     release();
     await pending;
-    const deadline = Date.now() + 5000;
-    while (am.accounts[0].activityOpen !== 0 && Date.now() < deadline) await new Promise(r => setTimeout(r, 10));
-    assert.equal(am.accounts[0].activityOpen, 0);
+    await until(() => am.accounts[0].activityOpen === 0);
     assert.equal(am.accounts[0].activitySeq, 1);
   } finally {
     proxy.close();
