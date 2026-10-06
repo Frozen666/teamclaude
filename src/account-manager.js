@@ -196,7 +196,9 @@ function emptyQuota() {
     unified7dFableSeenAt: null,
     unifiedStatus: null,        // allowed | allowed_warning | rejected
     // Normalized reading from a third-party backend (see backend-quota.js).
-    // { label, text, utilization, at } — nothing here knows which provider.
+    // { label, text, utilization, at, windows? } — nothing here knows which
+    // provider. windows feeds the fiveHour/weeklyShared/monthly buckets of
+    // /teamclaude/quota (quota-summary.js).
     backend: null,
     unifiedStatusSeenAt: null,  // ms timestamp of the response that reported it
     // Every model-scoped weekly bucket the usage endpoint named, keyed by its
@@ -4634,7 +4636,17 @@ export class AccountManager {
     }
     // Same sticky fact the header path records; see _updateCodexQuota.
     if (usage.fiveHour) q.sessionWindowStated = true;
-    else if (usage.sevenDay) q.sessionWindowStated = false;
+    else if (usage.sevenDay) {
+      q.sessionWindowStated = false;
+      // The probe reads every limit at once, so its word that a plan has no
+      // session window is what clears a reading left from before a plan
+      // change, which would otherwise keep gating selection until its reset.
+      // The header path does not clear: one response's headers are weaker
+      // evidence of absence than the whole usage payload.
+      q.unified5h = null;
+      q.unified5hReset = null;
+      q.unified5hSeenAt = null;
+    }
     if (usage.planType) q.planType = safeLine(usage.planType, 64);
     // Stamped, because nothing else refreshes it: a payload that mentions no
     // credits leaves the last reading alone rather than blanking it, so the

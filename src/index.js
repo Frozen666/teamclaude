@@ -9,7 +9,7 @@ import { loadOrCreateConfig, loadConfig, saveConfig, atomicConfigUpdate, getConf
 import { installCrashHandlers } from './crash-log.js';
 import { AccountManager, distributionMode, accountRouting } from './account-manager.js';
 import { validateAdaptiveConfig } from './adaptive-distribution.js';
-import { createProxyServer } from './server.js';
+import { createProxyServer, reloadedHeaderFlags } from './server.js';
 import { importCredentials, loginOAuth, loginOAuthWithPastedCode, fetchProfile, profileForCredentials, refreshAccessToken, isTokenExpired, isTokenExpiringSoon } from './oauth.js';
 import {
   sameIdentity,
@@ -31,7 +31,7 @@ import * as alias from './alias.js';
 import { ensureCerts, mitmHosts } from './mitm.js';
 import { Prober } from './prober.js';
 import { ResetCreditRedeemer } from './codex-reset-credits.js';
-import { Warmer } from './warmer.js';
+import { Warmer, warmApplicable } from './warmer.js';
 import { formatWarmupScheduleConfirmation, resolveWarmupConfig } from './warmup-schedule.js';
 import { TUI, ACCOUNT_SORTS } from './tui.js';
 import { SessionTitles } from './session-titles.js';
@@ -614,8 +614,9 @@ async function serverCommand() {
     config.autoRedeemResets = diskConfig.autoRedeemResets === true;
     config.blockedModels = Array.isArray(diskConfig.blockedModels) ? diskConfig.blockedModels : [];
     // Sampled off this object when each request is dispatched (server.js
-    // shouldStripOverageHeaders), so the reload applies to subsequent requests.
-    config.stripOverageHeaders = diskConfig.stripOverageHeaders === true;
+    // shouldStripOverageHeaders / shouldSynthesizeQuotaHeaders), so the reload
+    // applies to subsequent requests.
+    Object.assign(config, reloadedHeaderFlags(diskConfig));
     // Apply an sx.org key/mode change made on disk (e.g. via POST /teamclaude/reload).
     const diskSxKey = diskConfig.sx?.apiKey || null;
     const diskSxMode = diskConfig.sx?.mode || 'always';
@@ -857,7 +858,7 @@ async function serverCommand() {
       running: false,
       accounts: accountManager.accounts.map(account => ({
         name: account.name,
-        status: (account.type === 'oauth' && !account.upstream) ? 'never' : 'not-applicable',
+        status: warmApplicable(account) ? 'never' : 'not-applicable',
         lastWarmedAt: null,
         startedAt: null,
         durationMs: null,
