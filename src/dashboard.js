@@ -496,7 +496,7 @@ export function callerNotice(caller) {
  * @param {any} account  one entry of status.accounts
  */
 export function cardNoteKey(account) {
-  return [account.name, account.orgUuid || '', account.provider || ''].join('\n');
+  return [account.name, account.orgName || '', account.provider || ''].join('\n');
 }
 
 /**

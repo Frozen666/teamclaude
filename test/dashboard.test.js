@@ -1057,10 +1057,10 @@ test('cardNoteFor shows a result for its own card only, and only while recent', 
 });
 
 test('cardNoteKey tells apart two cards with one name', () => {
-  const a = cardNoteKey({ name: 'alice@example.com', orgUuid: 'org-1', provider: 'anthropic' });
-  const b = cardNoteKey({ name: 'alice@example.com', orgUuid: 'org-2', provider: 'anthropic' });
-  const c = cardNoteKey({ name: 'alice@example.com', orgUuid: 'org-1', provider: 'codex' });
+  const a = cardNoteKey({ name: 'alice@example.com', orgName: 'org-1', provider: 'anthropic' });
+  const b = cardNoteKey({ name: 'alice@example.com', orgName: 'org-2', provider: 'anthropic' });
+  const c = cardNoteKey({ name: 'alice@example.com', orgName: 'org-1', provider: 'codex' });
   assert.notEqual(a, b);
   assert.notEqual(a, c);
-  assert.equal(a, cardNoteKey({ name: 'alice@example.com', orgUuid: 'org-1', provider: 'anthropic' }));
+  assert.equal(a, cardNoteKey({ name: 'alice@example.com', orgName: 'org-1', provider: 'anthropic' }));
 });
