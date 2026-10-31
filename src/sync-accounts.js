@@ -217,7 +217,8 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
 
     if (freshCred.accessToken) {
       const changed = mgr.credential !== freshCred.accessToken ||
-        mgr.refreshToken !== freshCred.refreshToken;
+        // The manager keeps a missing refresh token as null, the disk entry as undefined.
+        (mgr.refreshToken || null) !== (freshCred.refreshToken || null);
       // Don't overwrite in-memory credentials with staler ones from disk
       // (e.g. after a TUI import updated the AM before saveConfig wrote to disk)
       const diskIsStaler = freshCred.expiresAt && mgr.expiresAt &&
@@ -232,6 +233,7 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
       // A different key is a different credential: the 401 hold was about the
       // old one, and the operator who just fixed it should not wait it out.
       accountManager.clearCredentialRejected(mgr.index);
+      accountManager.clearBillingRejected(mgr.index);
       console.log(`[TeamClaude] Updated API key for "${safeLine(mgr.name, 64)}"`);
     }
   }
